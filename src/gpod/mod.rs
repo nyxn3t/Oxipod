@@ -410,6 +410,79 @@ impl Database {
         Ok(())
     }
 
+    /// Song files in the iPod's music folders that no song in the database
+    /// points to, with their sizes. They take up space but the iPod can't play
+    /// them; they're usually left over from an interrupted sync.
+    pub fn orphaned_files(&self) -> Vec<(PathBuf, u64)> {
+        let Some(music_dir) = self.music_dir() else {
+            return Vec::new();
+        };
+        // A HashSet answers "is this path in here?" quickly, however big it is.
+        let used: std::collections::HashSet<PathBuf> = self
+            .track_ptrs()
+            .into_iter()
+            // SAFETY: the tracks belong to the database. itdb_filename_on_ipod
+            // returns a new string (or NULL) that we free with g_free.
+            .filter_map(|track| unsafe {
+                let file = ffi::itdb_filename_on_ipod(track);
+                if file.is_null() {
+                    return None;
+                }
+                let path = path_from_c(file);
+                ffi::g_free(file.cast());
+                Some(path)
+            })
+            .collect();
+
+        // The music is spread over folders F00, F01, …; anything else in the
+        // music folder is left alone.
+        let mut orphans = Vec::new();
+        let Ok(folders) = std::fs::read_dir(&music_dir) else {
+            return orphans;
+        };
+        for folder in folders.filter_map(|entry| entry.ok()) {
+            let name = folder.file_name();
+            let is_music_folder = name.to_str().is_some_and(|name| {
+                name.len() == 3 && name.starts_with(['F', 'f']) && name[1..].chars().all(|c| c.is_ascii_digit())
+            });
+            if !is_music_folder {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(folder.path()) else {
+                continue;
+            };
+            for file in files.filter_map(|entry| entry.ok()) {
+                let Ok(metadata) = file.metadata() else {
+                    continue;
+                };
+                if metadata.is_file() && !used.contains(&file.path()) {
+                    orphans.push((file.path(), metadata.len()));
+                }
+            }
+        }
+        orphans.sort();
+        orphans
+    }
+
+    /// iPod_Control/Music, with the capitalisation used on this iPod.
+    fn music_dir(&self) -> Option<PathBuf> {
+        // SAFETY: the mount point is owned by the database. itdb_get_music_dir
+        // returns a new string (or NULL) that we free with g_free.
+        unsafe {
+            let mount_point = ffi::itdb_get_mountpoint(self.raw());
+            if mount_point.is_null() {
+                return None;
+            }
+            let dir = ffi::itdb_get_music_dir(mount_point);
+            if dir.is_null() {
+                return None;
+            }
+            let path = path_from_c(dir);
+            ffi::g_free(dir.cast());
+            Some(path)
+        }
+    }
+
     fn track_ptrs(&self) -> Vec<*mut ffi::Itdb_Track> {
         // SAFETY: the track list is owned by the database.
         unsafe { glist_items((*self.raw()).tracks) }
@@ -640,6 +713,21 @@ mod tests {
         assert_eq!(db.tracks().len(), before);
         assert!(db.playlists().iter().all(|p| p.id != playlist));
         assert!(!pending.destination.exists(), "song file was not deleted");
+    }
+
+    // Puts a fake leftover file on the iPod, checks it's found, removes it.
+    #[test]
+    #[ignore = "writes to a mounted iPod"]
+    fn finds_leftover_files() {
+        let mount = PathBuf::from(std::env::var("OXIPOD_TEST_IPOD").expect("OXIPOD_TEST_IPOD is not set"));
+        let db = Database::open(&mount).unwrap();
+        assert!(db.orphaned_files().is_empty(), "the iPod already has leftovers");
+
+        let fake = db.music_dir().unwrap().join("F00").join("OXIPODTEST.mp3");
+        std::fs::write(&fake, b"not really music").unwrap();
+        let found = db.orphaned_files();
+        std::fs::remove_file(&fake).unwrap();
+        assert_eq!(found, vec![(fake, 16)]);
     }
 
     #[test]

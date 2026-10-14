@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::gdk_pixbuf::Pixbuf;
@@ -16,6 +16,14 @@ use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
 
 /// Shown at this size in the song list.
 const COVER_SIZE: i32 = 40;
+
+/// Space kept free on the iPod for the music and cover art databases, which
+/// grow with every song.
+const RESERVED_SPACE: u64 = 20 * 1024 * 1024;
+
+/// While adding songs, the database is saved at least this often, so that
+/// unplugging the iPod halfway loses at most a few songs.
+const SAVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Everything on the page, and the open database.
 ///
@@ -36,6 +44,8 @@ pub struct Library {
     eject_button: gtk::Button,
     progress: gtk::ProgressBar,
     progress_label: gtk::Label,
+    /// Offers to delete files the database doesn't know about.
+    leftovers_banner: adw::Banner,
     songs_group: adw::PreferencesGroup,
     songs: gtk::ListBox,
     playlists: gtk::ListBox,
@@ -44,6 +54,14 @@ pub struct Library {
     covers: RefCell<HashMap<TrackId, Option<gdk::Texture>>>,
     /// True while songs are being added; other changes wait until it's done.
     busy: Cell<bool>,
+}
+
+/// Why adding a song didn't work.
+enum ImportError {
+    /// Only this song failed; carry on with the next one.
+    Song(String),
+    /// Adding more songs is pointless (the iPod is full or gone).
+    Stop(String),
 }
 
 struct OpenPlaylist {
@@ -118,8 +136,11 @@ impl Library {
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&tabs));
 
+        let leftovers_banner = adw::Banner::builder().button_label("Clean Up…").build();
+
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
+        toolbar.add_top_bar(&leftovers_banner);
         toolbar.set_content(Some(&toasts));
         toolbar.add_bottom_bar(&progress_box);
         toolbar.set_reveal_bottom_bars(false);
@@ -140,6 +161,7 @@ impl Library {
             eject_button,
             progress,
             progress_label,
+            leftovers_banner,
             songs_group,
             songs,
             playlists,
@@ -151,6 +173,7 @@ impl Library {
         library.connect_signals(&new_playlist_button);
         library.add_actions();
         library.refresh();
+        library.check_leftovers();
         Ok(library)
     }
 
@@ -178,6 +201,13 @@ impl Library {
         self.eject_button.connect_clicked(move |_| {
             if let Some(this) = this.upgrade() {
                 this.eject();
+            }
+        });
+
+        let this = Rc::downgrade(self);
+        self.leftovers_banner.connect_button_clicked(move |_| {
+            if let Some(this) = this.upgrade() {
+                this.confirm_delete_leftovers();
             }
         });
 
@@ -260,8 +290,9 @@ impl Library {
         let total: Duration = tracks.iter().map(|track| track.length).sum();
         self.songs_group
             .set_title(&format!("{} Songs · {}", tracks.len(), format_duration(total)));
-        let model = [info.generation, info.model_number].into_iter().flatten().collect::<Vec<_>>();
-        self.songs_group.set_description(Some(&glib::markup_escape_text(&model.join(", "))));
+        let free = self.free_space().map(|bytes| format!("{} free", glib::format_size(bytes)));
+        let details = [info.generation, info.model_number, free].into_iter().flatten().collect::<Vec<_>>();
+        self.songs_group.set_description(Some(&glib::markup_escape_text(&details.join(" · "))));
 
         self.songs.remove_all();
         for track in &tracks {
@@ -429,73 +460,191 @@ impl Library {
         }
         self.add_button.set_sensitive(false);
         self.eject_button.set_sensitive(false);
+        self.leftovers_banner.set_revealed(false);
         self.progress.set_fraction(0.0);
         self.toolbar.set_reveal_bottom_bars(true);
 
         let mut added = 0;
         let mut failed = Vec::new();
+        let mut stopped = None;
+        let mut save_error = None;
+        let mut last_save = Instant::now();
         for (i, file) in files.iter().enumerate() {
             let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
             self.progress_label.set_text(&format!("Adding {} of {}: {name}", i + 1, files.len()));
             match self.import_file(file.clone()).await {
                 Ok(()) => added += 1,
-                Err(error) => failed.push(format!("{name}: {error}")),
+                Err(ImportError::Song(error)) => failed.push(format!("{name}: {error}")),
+                Err(ImportError::Stop(reason)) => {
+                    stopped = Some(reason);
+                    break;
+                }
             }
             self.progress.set_fraction((i + 1) as f64 / files.len() as f64);
+
+            if last_save.elapsed() >= SAVE_INTERVAL {
+                self.progress_label.set_text("Saving…");
+                if let Err(error) = self.db.borrow_mut().save() {
+                    save_error = Some(error);
+                    break;
+                }
+                last_save = Instant::now();
+            }
         }
 
-        self.progress_label.set_text("Saving…");
-        let saved = self.db.borrow_mut().save();
+        // Save at the end, unless a save already failed (that error is the
+        // one worth showing) or the iPod is gone (saving would fail anyway).
+        if save_error.is_none() && self.is_connected() {
+            self.progress_label.set_text("Saving…");
+            save_error = self.db.borrow_mut().save().err();
+        }
 
         self.busy.set(false);
         self.add_button.set_sensitive(true);
         self.eject_button.set_sensitive(true);
         self.toolbar.set_reveal_bottom_bars(false);
         self.refresh();
+        self.check_leftovers();
 
-        if let Err(error) = saved {
-            self.toast(&format!("Couldn't save the music database: {error}"));
-        } else if failed.is_empty() {
-            self.toast(&format!("Added {}", songs_count(added)));
-        } else {
-            for failure in &failed {
-                eprintln!("Couldn't add {failure}");
-            }
-            let first = &failed[0];
-            let more = if failed.len() > 1 { format!(" (and {} more)", failed.len() - 1) } else { String::new() };
-            self.toast(&format!("Added {}, couldn't add {first}{more}", songs_count(added)));
+        for failure in &failed {
+            eprintln!("Couldn't add {failure}");
         }
+        let message = if let Some(reason) = stopped {
+            format!("Added {}. {reason}", songs_count(added))
+        } else if let Some(error) = save_error {
+            format!("Couldn't save the music database: {error}")
+        } else if let Some(first) = failed.first() {
+            let more = if failed.len() > 1 { format!(" (and {} more)", failed.len() - 1) } else { String::new() };
+            format!("Added {}, couldn't add {first}{more}", songs_count(added))
+        } else {
+            format!("Added {}", songs_count(added))
+        };
+        self.toast(&message);
     }
 
-    async fn import_file(&self, file: PathBuf) -> Result<(), String> {
+    async fn import_file(&self, file: PathBuf) -> Result<(), ImportError> {
+        if !self.is_connected() {
+            return Err(ImportError::Stop("The iPod was disconnected.".into()));
+        }
+
         // spawn_blocking runs the closure on a background thread. Everything
         // it uses is moved into it, so `file` can't be used here afterwards.
         // The outer Result is Err if the thread panicked.
         let prepared = gio::spawn_blocking(move || convert::prepare(&file))
             .await
-            .map_err(|_| "the conversion crashed".to_string())?
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| ImportError::Song("the conversion crashed".into()))?
+            .map_err(|error| ImportError::Song(error.to_string()))?;
+
+        let size = std::fs::metadata(&prepared.file).map(|m| m.len()).unwrap_or(0);
+        if let Some(free) = self.free_space()
+            && free < size + RESERVED_SPACE
+        {
+            return Err(ImportError::Stop("The iPod is full.".into()));
+        }
 
         let pending = self
             .db
             .borrow_mut()
             .add_track(&prepared.track, &prepared.file)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ImportError::Song(error.to_string()))?;
 
         let (from, to) = (prepared.file.clone(), pending.destination.clone());
         let copied = gio::spawn_blocking(move || std::fs::copy(from, to)).await;
 
         let mut db = self.db.borrow_mut();
         let result = match copied {
-            Ok(Ok(_)) => db.finish_copy(&pending).map_err(|error| error.to_string()),
-            Ok(Err(error)) => Err(format!("copying failed: {error}")),
-            Err(_) => Err("copying crashed".to_string()),
+            Ok(Ok(_)) => db.finish_copy(&pending).map_err(|error| ImportError::Song(error.to_string())),
+            Ok(Err(error)) => Err(ImportError::Song(format!("copying failed: {error}"))),
+            Err(_) => Err(ImportError::Song("copying crashed".into())),
         };
         if result.is_err() {
             db.cancel_copy(&pending);
+            // A failed copy is often the iPod being unplugged.
+            if !self.is_connected() {
+                return Err(ImportError::Stop("The iPod was disconnected.".into()));
+            }
         }
         result
         // `prepared` is dropped here, which deletes the converted temp file.
+    }
+
+    /// Whether the iPod is still there. When it's unplugged, the mount
+    /// point disappears or becomes an empty folder.
+    fn is_connected(&self) -> bool {
+        self.mount_path.join("iPod_Control").is_dir()
+    }
+
+    /// Free space on the iPod in bytes, if it can be read.
+    fn free_space(&self) -> Option<u64> {
+        let info = gio::File::for_path(&self.mount_path)
+            .query_filesystem_info(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE, gio::Cancellable::NONE)
+            .ok()?;
+        Some(info.attribute_uint64(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE))
+    }
+
+    /// Shows the banner if the iPod has song files the database doesn't know.
+    fn check_leftovers(&self) {
+        let leftovers = self.db.borrow().orphaned_files();
+        if leftovers.is_empty() {
+            self.leftovers_banner.set_revealed(false);
+            return;
+        }
+        let size: u64 = leftovers.iter().map(|(_, size)| size).sum();
+        self.leftovers_banner.set_title(&format!(
+            "{} on the iPod aren't in its music database ({})",
+            files_count(leftovers.len()),
+            glib::format_size(size)
+        ));
+        self.leftovers_banner.set_revealed(true);
+    }
+
+    fn confirm_delete_leftovers(self: &Rc<Self>) {
+        if self.busy.get() {
+            return;
+        }
+        let leftovers = self.db.borrow().orphaned_files();
+        let size: u64 = leftovers.iter().map(|(_, size)| size).sum();
+        let dialog = adw::AlertDialog::new(
+            Some("Delete Leftover Files?"),
+            Some(&format!(
+                "{} ({}) are on the iPod but not in its music database, so the iPod can't play \
+                 them. They're usually left over from a sync that was interrupted.",
+                files_count(leftovers.len()),
+                glib::format_size(size)
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let this = Rc::downgrade(self);
+        dialog.connect_response(Some("delete"), move |_, _| {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            // Look again: only delete what is still unknown right now.
+            let leftovers = this.db.borrow().orphaned_files();
+            let mut freed = 0;
+            let mut failed = 0;
+            for (path, size) in &leftovers {
+                match std::fs::remove_file(path) {
+                    Ok(()) => freed += size,
+                    Err(error) => {
+                        eprintln!("Couldn't delete {}: {error}", path.display());
+                        failed += 1;
+                    }
+                }
+            }
+            this.refresh();
+            this.check_leftovers();
+            if failed == 0 {
+                this.toast(&format!("Freed {}", glib::format_size(freed)));
+            } else {
+                this.toast(&format!("Freed {}, couldn't delete {}", glib::format_size(freed), files_count(failed)));
+            }
+        });
+        dialog.present(Some(&self.page));
     }
 
     fn confirm_delete(self: &Rc<Self>, id: TrackId) {
@@ -703,6 +852,10 @@ fn boxed_list(placeholder: &str) -> gtk::ListBox {
 /// Songs sorted by title, ignoring case, like the iPod does.
 fn sort_key(track: &Track) -> String {
     track.title.as_deref().unwrap_or_default().to_lowercase()
+}
+
+fn files_count(count: usize) -> String {
+    if count == 1 { "1 file".into() } else { format!("{count} files") }
 }
 
 fn songs_count(count: usize) -> String {
