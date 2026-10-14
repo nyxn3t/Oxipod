@@ -34,6 +34,13 @@
     </p>
   </description>
 
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/main/data/screenshots/songs.png</image>
+      <caption>The songs on an iPod nano</caption>
+    </screenshot>
+  </screenshots>
+
   <launchable type="desktop-id">io.github.nyxn3t.Oxipod.desktop</launchable>
   <provides>
     <binary>oxipod</binary>
