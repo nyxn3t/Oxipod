@@ -10,7 +10,7 @@ fn main() {
     // probe_library also tells Cargo to link against the library.
     let gpod = pkg_config::probe_library("libgpod-1.0")
         .expect("libgpod-1.0 not found, install libgpod-devel");
-    // We call g_error_free ourselves, so link glib directly too.
+    // We call a few glib functions ourselves, so link glib directly too.
     pkg_config::probe_library("glib-2.0").expect("glib-2.0 not found, install glib2-devel");
 
     let include_args = gpod
@@ -24,6 +24,9 @@ fn main() {
         // Only generate what we use; bindgen pulls in the types these need.
         .allowlist_function("itdb_.*")
         .allowlist_type("Itdb_.*")
+        // Strings libgpod frees must be allocated by glib.
+        .allowlist_function("g_strdup")
+        .allowlist_function("g_free")
         .allowlist_function("g_error_free")
         // Rebuild when the header changes.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
