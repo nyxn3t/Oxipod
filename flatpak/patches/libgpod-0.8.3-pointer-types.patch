@@ -1,0 +1,22 @@
+--- a/src/ithumb-writer.c~	2011-07-24 06:08:03.000000000 -0500
++++ b/src/ithumb-writer.c	2024-01-31 10:24:16.329797712 -0600
+@@ -968,7 +968,7 @@
+     else if (thumb->data_type == ITDB_THUMB_TYPE_PIXBUF)
+     {
+         Itdb_Thumb_Pixbuf *thumb_pixbuf = (Itdb_Thumb_Pixbuf *)thumb;
+-        pixbuf = g_object_ref (G_OBJECT (thumb_pixbuf->pixbuf));
++        pixbuf = (GdkPixbuf *)(g_object_ref (G_OBJECT (thumb_pixbuf->pixbuf)));
+     }
+ 
+     if (pixbuf == NULL)
+--- libgpod-0.8.3/src/ithumb-writer.c~	2024-01-31 10:24:16.329797712 -0600
++++ libgpod-0.8.3/src/ithumb-writer.c	2024-01-31 10:33:27.699960523 -0600
+@@ -728,7 +728,7 @@
+   {
+       return gdk_pixbuf_rotate_simple (pixbuf, *rotation);
+   }
+-  return g_object_ref (G_OBJECT (pixbuf));
++  return (GdkPixbuf *)(g_object_ref (G_OBJECT (pixbuf)));
+ }
+ 
+ /* On the iPhone, thumbnails are presented as squares in a grid.

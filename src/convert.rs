@@ -390,6 +390,41 @@ mod tests {
         assert_eq!(track.year, 2019);
     }
 
+    // Makes a FLAC file with tags and embedded cover art, then checks that
+    // it's converted to MP3 and the tags and cover come along.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn converts_flac_with_cover_art() {
+        let dir = tempfile::tempdir().unwrap();
+        let flac = dir.path().join("song.flac");
+        let ffmpeg = |args: &[&str]| {
+            let status = Command::new("ffmpeg").args(["-v", "error", "-y"]).args(args).status().unwrap();
+            assert!(status.success());
+        };
+        let cover = dir.path().join("cover.png");
+        ffmpeg(&["-f", "lavfi", "-i", "testsrc=size=600x600", "-frames:v", "1", cover.to_str().unwrap()]);
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "sine=duration=3:sample_rate=96000",
+            "-i", cover.to_str().unwrap(),
+            "-map", "0", "-map", "1", "-c:a", "flac", "-c:v", "copy", "-disposition:v", "attached_pic",
+            "-metadata", "title=Test Song", "-metadata", "artist=Test Artist",
+            "-metadata", "album=Test Album", "-metadata", "track=2/9",
+            flac.to_str().unwrap(),
+        ]);
+
+        let prepared = prepare(&flac).expect("prepare failed");
+        assert_eq!(prepared.track.file_type, FileType::Mp3);
+        assert_eq!(prepared.track.sample_rate, 44_100, "96 kHz should be resampled");
+        assert_eq!(prepared.track.title, "Test Song");
+        assert_eq!(prepared.track.artist.as_deref(), Some("Test Artist"));
+        assert_eq!((prepared.track.track_number, prepared.track.track_count), (2, 9));
+        assert!((prepared.track.length.as_secs_f64() - 3.0).abs() < 0.1);
+        let cover = prepared.track.cover.expect("no cover art");
+        assert_eq!(&cover[..2], &[0xFF, 0xD8], "cover should be a JPEG");
+        let image = gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(cover)).unwrap();
+        assert!(image.width() <= COVER_SIZE as i32 && image.height() <= COVER_SIZE as i32);
+    }
+
     #[test]
     #[ignore = "needs ffmpeg and the test file in the home folder"]
     fn converts_the_webm_from_youtube() {

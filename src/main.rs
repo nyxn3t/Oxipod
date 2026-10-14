@@ -1,5 +1,6 @@
 mod convert;
 mod device;
+mod eject;
 mod gpod;
 mod library;
 
@@ -24,6 +25,9 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &adw::Application) {
+    // Use the app icon for the window (once it's installed).
+    gtk::Window::set_default_icon_name(APP_ID);
+
     // Shown when no iPod is connected.
     let empty_page = adw::StatusPage::builder()
         .icon_name("multimedia-player-symbolic")

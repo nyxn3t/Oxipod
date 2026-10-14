@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ed8150"/>
+      <stop offset="1" stop-color="#b8461a"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b2a33"/>
+      <stop offset="1" stop-color="#17161c"/>
+    </linearGradient>
+    <linearGradient id="wheel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff8f3"/>
+      <stop offset="1" stop-color="#f1dccf"/>
+    </linearGradient>
+  </defs>
+  <!-- depth below the body -->
+  <rect x="22" y="14" width="84" height="106" rx="19" fill="#7a2a0c"/>
+  <!-- body -->
+  <rect x="22" y="8" width="84" height="106" rx="19" fill="url(#body)"/>
+  <rect x="23" y="9" width="82" height="104" rx="18" fill="none" stroke="#ffffff" stroke-opacity="0.25" stroke-width="2"/>
+  <!-- screen -->
+  <rect x="32" y="18" width="64" height="42" rx="6" fill="url(#screen)"/>
+  <rect x="38" y="24" width="30" height="3" rx="1.5" fill="#f6d5c0" fill-opacity="0.35"/>
+  <rect x="38" y="51" width="52" height="3" rx="1.5" fill="#f6d5c0" fill-opacity="0.2"/>
+  <rect x="38" y="51" width="22" height="3" rx="1.5" fill="#ed8150"/>
+  <!-- music note -->
+  <path d="M74 29 L88 26 L88 42.5 A4.5 3.6 0 1 1 85 39.2 L85 32.5 L77 34.2 L77 45.5 A4.5 3.6 0 1 1 74 42.2 Z" fill="#f6d5c0"/>
+  <!-- click wheel -->
+  <circle cx="64" cy="87" r="21" fill="#9c3a14" fill-opacity="0.45" transform="translate(0 1.5)"/>
+  <circle cx="64" cy="87" r="21" fill="url(#wheel)"/>
+  <circle cx="64" cy="87" r="8" fill="#c9581f"/>
+  <circle cx="64" cy="87" r="8" fill="none" stroke="#7a2a0c" stroke-opacity="0.3" stroke-width="1"/>
+  <g fill="#b8461a" fill-opacity="0.55">
+    <rect x="61" y="69.5" width="6" height="2" rx="1"/>
+    <path d="M59.5 101 L59.5 105 L63 103 Z"/>
+    <rect x="64.5" y="101" width="1.4" height="4"/>
+    <rect x="67" y="101" width="1.4" height="4"/>
+    <path d="M47 85 L47 89 L44 87 Z M44 85 L44 89 L41.5 87 Z" transform="translate(4 0)"/>
+    <path d="M81 85 L81 89 L84 87 Z M84 85 L84 89 L86.5 87 Z" transform="translate(-4 0)"/>
+  </g>
+</svg>

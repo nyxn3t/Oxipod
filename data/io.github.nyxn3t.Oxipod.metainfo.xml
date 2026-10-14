@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 nyxn3t -->
+<component type="desktop-application">
+  <id>io.github.nyxn3t.Oxipod</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Oxipod</name>
+  <summary>Put music on your old iPod</summary>
+  <developer id="io.github.nyxn3t">
+    <name>nyxn3t</name>
+  </developer>
+
+  <description>
+    <p>
+      Oxipod adds music to iPods that sync through iTunes, without needing
+      iTunes. Plug in your iPod, drop your music on the window, and it's ready
+      to play.
+    </p>
+    <ul>
+      <li>Add songs and whole folders by dragging them onto the window</li>
+      <li>Converts FLAC, Opus, Ogg, WAV and other formats to MP3 automatically</li>
+      <li>Copies cover art from the file or from a cover image in the album folder</li>
+      <li>Create playlists and add or remove songs</li>
+      <li>Delete songs from the iPod</li>
+      <li>Finds and cleans up leftover files from interrupted syncs</li>
+    </ul>
+    <p>
+      Oxipod is built on libgpod, so it should work with the iPods libgpod
+      supports, like the iPod classic, the mini and the nano up to the 4th
+      generation. So far it has only been tested with the iPod nano 3rd
+      generation. The touchscreen nano (6th and 7th generation), the iPod touch
+      and iPhones are not supported.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.nyxn3t.Oxipod.desktop</launchable>
+  <provides>
+    <binary>oxipod</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/nyxn3t/Oxipod</url>
+  <url type="bugtracker">https://github.com/nyxn3t/Oxipod/issues</url>
+  <url type="vcs-browser">https://github.com/nyxn3t/Oxipod</url>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#f0b089</color>
+    <color type="primary" scheme_preference="dark">#7a2a0c</color>
+  </branding>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0" date="2026-10-14">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

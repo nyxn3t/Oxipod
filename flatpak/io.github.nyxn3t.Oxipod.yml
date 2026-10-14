@@ -1,0 +1,152 @@
+app-id: io.github.nyxn3t.Oxipod
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang, for bindgen (generates the libgpod bindings at build time).
+  - org.freedesktop.Sdk.Extension.llvm22
+command: oxipod
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  # The iPod gets mounted here; Oxipod reads and writes its music folder.
+  - --filesystem=/run/media
+  - --filesystem=/media
+  # Ejects the iPod ("Safely Remove"). The app can't unmount drives itself
+  # inside the sandbox.
+  - --system-talk-name=org.freedesktop.UDisks2
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+  - /share/doc
+  - /share/gtk-doc
+  - '*.la'
+  - '*.a'
+
+modules:
+  # Needed by libgpod for the databases of newer iPods.
+  - name: libplist
+    config-opts:
+      - --disable-static
+      - --without-cython
+    post-install:
+      # libgpod 0.8.3 looks for "libplist", but libplist 2.x is called
+      # "libplist-2.0". An alias avoids patching and regenerating configure.
+      - ln -s libplist-2.0.pc /app/lib/pkgconfig/libplist.pc
+    cleanup:
+      - /bin
+    sources:
+      - type: archive
+        url: https://github.com/libimobiledevice/libplist/releases/download/2.8.0/libplist-2.8.0.tar.bz2
+        sha256: b1f59f7634c58b2481325a23ff4e3bf51574a42d868cbe466d2b39b04550752a
+
+  # Only needed to build libgpod.
+  - name: intltool
+    cleanup:
+      - '*'
+    sources:
+      - type: archive
+        url: https://launchpad.net/intltool/trunk/0.51.0/+download/intltool-0.51.0.tar.gz
+        sha256: 67c74d94196b153b774ab9f89b2fa6c6ba79352407037c8c14d5aeb334e959cd
+
+  # Reads and writes the iPod's music database. Unmaintained upstream, so the
+  # patches (from Fedora) keep it building with current libplist and GCC.
+  - name: libgpod
+    config-opts:
+      - --disable-static
+      - --without-hal
+      - --disable-udev
+      - --with-python=no
+      - --without-mono
+      - --disable-pygobject
+      - --without-libimobiledevice
+      - --disable-gtk-doc
+    cleanup:
+      - /bin
+      - /share/locale
+    sources:
+      - type: archive
+        url: https://downloads.sourceforge.net/project/gtkpod/libgpod/libgpod-0.8/libgpod-0.8.3.tar.bz2
+        sha256: 638a7959d04e95f1e62abad02bd33702e4e8dfef98485ac7d9d50395c37e955d
+      - type: patch
+        paths:
+          - patches/libgpod-0.8.3-no-plist_dict_insert_item.patch
+          - patches/libgpod-0.8.3-implicit-int.patch
+          - patches/libgpod-0.8.3-pointer-types.patch
+          - patches/libgpod-0.8.3-playcounts.patch
+
+  # MP3 encoder used by ffmpeg. Only built as a static library for ffmpeg.
+  - name: lame
+    config-opts:
+      - --disable-shared
+      - --enable-static
+      - --disable-frontend
+      - --disable-decoder
+    cleanup:
+      - '*'
+    sources:
+      - type: archive
+        url: https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+        sha256: ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
+
+  # ffmpeg and ffprobe, built with only what Oxipod needs: reading common
+  # audio formats and cover art, and writing MP3 and JPEG.
+  - name: ffmpeg
+    config-opts:
+      - --disable-shared
+      - --enable-static
+      - --disable-debug
+      - --disable-doc
+      - --disable-ffplay
+      - --disable-network
+      - --disable-autodetect
+      - --disable-everything
+      - --enable-zlib
+      - --enable-libmp3lame
+      - --enable-protocol=file,pipe
+      - --enable-demuxer=aac,aiff,ape,asf,flac,matroska,mov,mp3,ogg,wav,wv
+      - --enable-muxer=mp3,image2,image2pipe
+      - --enable-decoder=aac,alac,ape,flac,mp3,mp3float,opus,vorbis,wavpack,wmav1,wmav2,wmapro,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,pcm_f32le,pcm_f32be,pcm_u8,mjpeg,png,bmp,gif,webp
+      - --enable-encoder=libmp3lame,mjpeg
+      - --enable-parser=aac,flac,mjpeg,mpegaudio,opus,png,vorbis
+      - --enable-filter=aformat,anull,aresample,format,null,scale
+    cleanup:
+      - /lib
+      - /share
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz
+        sha256: 7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
+
+  - name: oxipod
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+      prepend-ld-library-path: /usr/lib/sdk/llvm22/lib
+      env:
+        LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+        CARGO_HOME: /run/build/oxipod/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/oxipod -t /app/bin/
+      - install -Dm644 data/io.github.nyxn3t.Oxipod.desktop -t /app/share/applications/
+      - install -Dm644 data/io.github.nyxn3t.Oxipod.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 data/icons/hicolor/scalable/apps/io.github.nyxn3t.Oxipod.svg -t /app/share/icons/hicolor/scalable/apps/
+      - install -Dm644 data/icons/hicolor/symbolic/apps/io.github.nyxn3t.Oxipod-symbolic.svg -t /app/share/icons/hicolor/symbolic/apps/
+    sources:
+      # For local builds. The Flathub manifest uses a git tag instead.
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - .flatpak-builder
+          - flatpak/build
+          - flatpak/repo
+      - cargo-sources.json

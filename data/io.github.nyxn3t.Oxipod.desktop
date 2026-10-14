@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Oxipod
+Comment=Put music on your old iPod
+Exec=oxipod
+Icon=io.github.nyxn3t.Oxipod
+Terminal=false
+Type=Application
+Categories=GTK;GNOME;AudioVideo;Audio;
+Keywords=iPod;music;sync;nano;classic;mp3;
+StartupNotify=true

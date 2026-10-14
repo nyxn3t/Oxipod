@@ -2,6 +2,11 @@
 name = "oxipod"
 version = "0.1.0"
 edition = "2024"
+description = "Put music on your old iPod"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/nyxn3t/Oxipod"
+keywords = ["ipod", "music", "gtk", "libgpod"]
+categories = ["multimedia::audio"]
 
 [dependencies]
 adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"] }

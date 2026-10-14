@@ -12,6 +12,7 @@ use gtk::gdk_pixbuf::Pixbuf;
 use gtk::{gdk, gio, glib};
 
 use crate::convert;
+use crate::eject;
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
 
 /// Shown at this size in the song list.
@@ -780,21 +781,13 @@ impl Library {
     }
 
     fn eject(self: &Rc<Self>) {
-        let file = gio::File::for_path(&self.mount_path);
+        self.eject_button.set_sensitive(false);
         let this = self.clone();
         glib::spawn_future_local(async move {
-            let result = async {
-                // Looking up the mount is quick (gio already knows it); the
-                // eject itself can take a few seconds, so that one is async.
-                let mount = file.find_enclosing_mount(gio::Cancellable::NONE)?;
-                mount
-                    .eject_with_operation_future(gio::MountUnmountFlags::NONE, None::<&gio::MountOperation>)
-                    .await
-            }
-            .await;
             // On success the iPod disappears and the window goes back to the
             // device list by itself.
-            if let Err(error) = result {
+            if let Err(error) = eject::eject(&this.mount_path).await {
+                this.eject_button.set_sensitive(true);
                 this.toast(&format!("Couldn't eject: {}", error.message()));
             }
         });
