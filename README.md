@@ -15,7 +15,8 @@ music on the window, and that's it.
 - Copies cover art, either from the file or from a `cover.jpg` in the album
   folder
 - Playlists: create them, add songs, remove songs
-- Delete songs from the iPod
+- Delete songs from the iPod, or select a bunch and delete them or add them
+  to a playlist in one go
 - Cleans up leftover files from syncs that got interrupted
 - Ejects the iPod when you're done
 
@@ -25,7 +26,7 @@ Grab the `.flatpak` file from the [latest release](https://github.com/nyxn3t/Oxi
 and install it:
 
 ```
-flatpak install --user oxipod-0.1.0.flatpak
+flatpak install --user oxipod-*.flatpak
 ```
 
 It pulls in the GNOME runtime from Flathub if you don't have it yet. Oxipod

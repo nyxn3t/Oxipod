@@ -22,7 +22,7 @@
       <li>Converts FLAC, Opus, Ogg, WAV and other formats to MP3 automatically</li>
       <li>Copies cover art from the file or from a cover image in the album folder</li>
       <li>Create playlists and add or remove songs</li>
-      <li>Delete songs from the iPod</li>
+      <li>Delete songs from the iPod, one at a time or several at once</li>
       <li>Finds and cleans up leftover files from interrupted syncs</li>
     </ul>
     <p>
@@ -36,7 +36,7 @@
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.1.0/data/screenshots/songs.png</image>
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.2.0/data/screenshots/songs.png</image>
       <caption>The songs on an iPod nano</caption>
     </screenshot>
   </screenshots>
@@ -66,6 +66,11 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.2.0" date="2026-10-14">
+      <description>
+        <p>Select several songs at once to delete them or add them to a playlist.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-14">
       <description>
         <p>First release.</p>
