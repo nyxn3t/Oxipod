@@ -5,9 +5,12 @@ use std::path::PathBuf;
 use gtk::gio;
 use gtk::prelude::*;
 
+use crate::gpod;
+
 /// A mounted iPod.
 pub struct Ipod {
-    /// The drive label, e.g. "DYLAN'S IPO".
+    /// The name set in iTunes, e.g. "dylan's iPod". Falls back to the drive
+    /// label (e.g. "DYLAN_S IPO") when the database can't be read.
     pub name: String,
     /// Where the drive is mounted, e.g. /run/media/dylan/DYLAN_S IPO.
     pub mount_path: PathBuf,
@@ -30,8 +33,11 @@ pub fn find_ipods(monitor: &gio::VolumeMonitor) -> Vec<Ipod> {
             }
 
             let (free_bytes, total_bytes) = disk_space(&mount.root()).unwrap_or((0, 0));
+            // `.ok()` turns a Result into an Option, dropping the error;
+            // `and_then` only runs when there is a value.
+            let db_name = gpod::Database::open(&path).ok().and_then(|db| db.name());
             Some(Ipod {
-                name: mount.name().to_string(),
+                name: db_name.unwrap_or_else(|| mount.name().to_string()),
                 mount_path: path,
                 free_bytes,
                 total_bytes,
