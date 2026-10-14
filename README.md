@@ -19,6 +19,19 @@ music on the window, and that's it.
 - Cleans up leftover files from syncs that got interrupted
 - Ejects the iPod when you're done
 
+## Installing
+
+Grab the `.flatpak` file from the [latest release](https://github.com/nyxn3t/Oxipod/releases/latest)
+and install it:
+
+```
+flatpak install --user oxipod-0.1.0.flatpak
+```
+
+It pulls in the GNOME runtime from Flathub if you don't have it yet. Oxipod
+isn't on Flathub itself (yet), so updates won't show up automatically: check
+the releases page now and then.
+
 ## Which iPods work
 
 Oxipod uses [libgpod](https://sourceforge.net/projects/gtkpod/) to talk to the
