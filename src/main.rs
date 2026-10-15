@@ -212,6 +212,25 @@ fn build_ui(app: &adw::Application) {
     }
     actions.add_action(&back_up);
 
+    // "Restore from Backup…": puts a backup back on the iPod. Like "Back Up…" it
+    // gets the mount path and the name of the iPod.
+    let restore = gio::SimpleAction::new("restore", Some(&<(String, String)>::static_variant_type()));
+    {
+        let context = context.clone();
+        restore.connect_activate(move |_, target| {
+            if let Some((mount_path, name)) = target.and_then(|target| target.get::<(String, String)>()) {
+                // Restoring writes to the iPod.
+                let access = device::access(Path::new(&mount_path));
+                if access.read_only {
+                    library::read_only_dialog(access.filesystem.as_deref()).present(Some(&context.window));
+                    return;
+                }
+                start_restore(&context, PathBuf::from(mount_path), name);
+            }
+        });
+    }
+    actions.add_action(&restore);
+
     // `refresh` is moved into the first handler, so the others get clones.
     // A closure can be cloned when everything it captures can be cloned,
     // and GTK widgets are reference-counted, so cloning one is cheap.
@@ -494,6 +513,9 @@ fn show_ipods(monitor: &gio::VolumeMonitor, list: &gtk::ListBox, stack: &gtk::St
         let back_up = gio::MenuItem::new(Some("Back Up…"), None);
         back_up.set_action_and_target_value(Some("device.back-up"), Some(&target));
         menu.append_item(&back_up);
+        let restore = gio::MenuItem::new(Some("Restore from Backup…"), None);
+        restore.set_action_and_target_value(Some("device.restore"), Some(&target));
+        menu.append_item(&restore);
         let copy_all = gio::MenuItem::new(Some("Copy All to Computer…"), None);
         let path_target = ipod.mount_path.to_string_lossy().to_variant();
         copy_all.set_action_and_target_value(Some("device.copy-all"), Some(&path_target));
@@ -533,6 +555,15 @@ enum BackupResult {
     Failed(String),
 }
 
+/// What a backup is for. It changes the texts around it and the name of its folder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackupKind {
+    /// The backup the person asked for, or was offered.
+    Normal,
+    /// The copy of what is on the iPod, made right before a backup is put back on it.
+    BeforeRestore,
+}
+
 /// Asks where to save a backup of the iPod, makes it, and says how it went.
 /// With `open_after` the iPod opens afterwards: the backup was offered
 /// because the person was opening the iPod.
@@ -541,7 +572,7 @@ fn start_backup(context: &Context, mount_path: PathBuf, name: String, open_after
     // A backup takes a while. This future keeps GTK responsive while it waits,
     // like renaming does.
     glib::spawn_future_local(async move {
-        match make_backup(&context, &mount_path, &name).await {
+        match make_backup(&context, &mount_path, &name, BackupKind::Normal).await {
             BackupResult::Done(done) => {
                 context.backed_up.borrow_mut().insert(mount_path.clone());
                 show_backup_done(&context, mount_path, done, open_after);
@@ -552,7 +583,7 @@ fn start_backup(context: &Context, mount_path: PathBuf, name: String, open_after
     });
 }
 
-async fn make_backup(context: &Context, mount_path: &Path, name: &str) -> BackupResult {
+async fn make_backup(context: &Context, mount_path: &Path, name: &str, kind: BackupKind) -> BackupResult {
     let items = match backup::plan(mount_path) {
         Ok(items) => items,
         Err(error) => return BackupResult::Failed(error.to_string()),
@@ -560,7 +591,11 @@ async fn make_backup(context: &Context, mount_path: &Path, name: &str) -> Backup
     let total: u64 = items.iter().map(|item| item.size).sum();
 
     // Where to put it. The backup gets a folder of its own inside the one chosen.
-    let chooser = gtk::FileDialog::builder().title("Choose Where to Save the Backup").accept_label("Back Up").build();
+    let (title, accept_label) = match kind {
+        BackupKind::Normal => ("Choose Where to Save the Backup", "Back Up"),
+        BackupKind::BeforeRestore => ("Choose Where to Save the iPod's Current State", "Save"),
+    };
+    let chooser = gtk::FileDialog::builder().title(title).accept_label(accept_label).build();
     if let Some(documents) = glib::user_special_dir(glib::UserDirectory::Documents) {
         chooser.set_initial_folder(Some(&gio::File::for_path(documents)));
     }
@@ -583,47 +618,27 @@ async fn make_backup(context: &Context, mount_path: &Path, name: &str) -> Backup
 
     let now = glib::DateTime::now_local().ok();
     let when = |format: &str| now.as_ref().and_then(|now| now.format(format).ok()).map(String::from).unwrap_or_default();
-    let folder_name = backup::folder_name(name, &when("%Y-%m-%d %H%M"));
-    let note = backup::note(name, &when("%-d %B %Y, %H:%M"));
+    let (stamp, long_stamp) = (when("%Y-%m-%d %H%M"), when("%-d %B %Y, %H:%M"));
+    let (folder_name, note) = match kind {
+        BackupKind::Normal => (backup::folder_name(name, &stamp), backup::note(name, &long_stamp)),
+        BackupKind::BeforeRestore => {
+            (backup::safety_folder_name(name, &stamp), backup::note_before_restore(name, &long_stamp))
+        }
+    };
 
     // The progress window. It can't be closed until the backup is over, but it
     // has a Cancel button.
-    let bar = gtk::ProgressBar::builder().show_text(true).build();
-    let cancel_button = gtk::Button::builder().label("Cancel").halign(gtk::Align::Center).build();
-    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(18).build();
-    content.append(&bar);
-    content.append(&cancel_button);
-    let dialog = adw::AlertDialog::new(Some("Backing Up…"), Some("Keep the iPod plugged in until this is done."));
-    dialog.set_extra_child(Some(&content));
-    dialog.set_can_close(false);
-
+    //
     // The thread that copies and this code both look at these. An `Arc` is
     // like an `Rc` that may be shared with another thread, and the atomic
     // types can be changed from several threads at once.
     let copied = Arc::new(AtomicU64::new(0));
     let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let cancel = cancel.clone();
-        cancel_button.connect_clicked(move |button| {
-            cancel.store(true, Ordering::Relaxed);
-            button.set_sensitive(false);
-        });
-    }
-    dialog.present(Some(&context.window));
-
-    // Keeps the bar up to date, ten times a second, until the copying is over.
-    let finished = Rc::new(Cell::new(false));
-    glib::spawn_future_local({
-        let (copied, finished) = (copied.clone(), finished.clone());
-        async move {
-            while !finished.get() {
-                let done = copied.load(Ordering::Relaxed);
-                bar.set_fraction(if total > 0 { done as f64 / total as f64 } else { 0.0 });
-                bar.set_text(Some(&format!("{} of {}", glib::format_size(done), glib::format_size(total))));
-                glib::timeout_future(Duration::from_millis(100)).await;
-            }
-        }
-    });
+    let heading = match kind {
+        BackupKind::Normal => "Backing Up…",
+        BackupKind::BeforeRestore => "Saving the iPod's Current State…",
+    };
+    let progress = Progress::show(context, heading, total, &copied, Some(&cancel));
 
     // Everything the thread uses is moved into it.
     let (ipod, thread_copied, thread_cancel) = (mount_path.to_path_buf(), copied.clone(), cancel.clone());
@@ -631,9 +646,7 @@ async fn make_backup(context: &Context, mount_path: &Path, name: &str) -> Backup
         backup::back_up(&ipod, &items, &destination, &folder_name, &note, &thread_copied, &thread_cancel)
     })
     .await;
-    finished.set(true);
-    dialog.set_can_close(true);
-    dialog.force_close();
+    progress.finish();
 
     match result {
         Ok(Ok(done)) => BackupResult::Done(done),
@@ -659,19 +672,269 @@ fn show_backup_done(context: &Context, mount_path: PathBuf, done: backup::Done, 
     dialog.connect_response(None, move |_, response| {
         let context = &context_for_response;
         if response == "show" {
-            let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&done.folder)));
-            let window = context.window.clone();
-            glib::spawn_future_local(async move {
-                if let Err(error) = launcher.open_containing_folder_future(Some(&window)).await {
-                    eprintln!("Couldn't show the folder: {error}");
-                }
-            });
+            show_folder(context, &done.folder);
         }
         if open_after {
             open_ipod_soon(context, mount_path.clone(), |_| {});
         }
     });
     dialog.present(Some(&context.window));
+}
+
+/// Shows a folder in the file manager.
+fn show_folder(context: &Context, folder: &Path) {
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(folder)));
+    let window = context.window.clone();
+    glib::spawn_future_local(async move {
+        if let Err(error) = launcher.open_containing_folder_future(Some(&window)).await {
+            eprintln!("Couldn't show the folder: {error}");
+        }
+    });
+}
+
+/// A window with a progress bar, for a job that runs on another thread and
+/// counts the bytes it has done in `copied`. Close it with `finish` when the
+/// job is over; nobody can close it by hand before that. A job that can be
+/// cancelled gets a Cancel button, which sets `cancel`.
+struct Progress {
+    dialog: adw::AlertDialog,
+    finished: Rc<Cell<bool>>,
+}
+
+impl Progress {
+    fn show(
+        context: &Context,
+        heading: &str,
+        total: u64,
+        copied: &Arc<AtomicU64>,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Progress {
+        let bar = gtk::ProgressBar::builder().show_text(true).build();
+        let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(18).build();
+        content.append(&bar);
+        if let Some(cancel) = cancel {
+            let cancel_button = gtk::Button::builder().label("Cancel").halign(gtk::Align::Center).build();
+            let cancel = cancel.clone();
+            cancel_button.connect_clicked(move |button| {
+                cancel.store(true, Ordering::Relaxed);
+                button.set_sensitive(false);
+            });
+            content.append(&cancel_button);
+        }
+        let dialog = adw::AlertDialog::new(Some(heading), Some("Keep the iPod plugged in until this is done."));
+        dialog.set_extra_child(Some(&content));
+        dialog.set_can_close(false);
+        dialog.present(Some(&context.window));
+
+        // Keeps the bar up to date, ten times a second, until the job is over.
+        let finished = Rc::new(Cell::new(false));
+        glib::spawn_future_local({
+            let (copied, finished) = (copied.clone(), finished.clone());
+            async move {
+                while !finished.get() {
+                    let done = copied.load(Ordering::Relaxed);
+                    bar.set_fraction(if total > 0 { done as f64 / total as f64 } else { 0.0 });
+                    bar.set_text(Some(&format!("{} of {}", glib::format_size(done), glib::format_size(total))));
+                    glib::timeout_future(Duration::from_millis(100)).await;
+                }
+            }
+        });
+        Progress { dialog, finished }
+    }
+
+    fn finish(self) {
+        self.finished.set(true);
+        self.dialog.set_can_close(true);
+        self.dialog.force_close();
+    }
+}
+
+/// Puts a backup back on the iPod. Like the backup, it takes a while and
+/// keeps GTK responsive with a future.
+fn start_restore(context: &Context, mount_path: PathBuf, name: String) {
+    let context = context.clone();
+    glib::spawn_future_local(async move {
+        restore_backup(&context, &mount_path, &name).await;
+    });
+}
+
+/// Puts a backup back on the iPod, step by step: choose the backup, check
+/// that it is a backup of this iPod and can be read, ask, save what is on the
+/// iPod now (so this can be undone), put the backup on it. Nothing on the iPod
+/// changes before the last step, so every step before it can just stop.
+async fn restore_backup(context: &Context, mount_path: &Path, name: &str) {
+    let chooser = gtk::FileDialog::builder().title("Choose the Backup to Restore").accept_label("Choose").build();
+    if let Some(documents) = glib::user_special_dir(glib::UserDirectory::Documents) {
+        chooser.set_initial_folder(Some(&gio::File::for_path(documents)));
+    }
+    // An error here means the chooser was closed without choosing.
+    let Ok(folder) = chooser.select_folder_future(Some(&context.window)).await else {
+        return;
+    };
+    let Some(folder) = folder.path() else {
+        return show_error(context, "Can't Use That Folder", "That folder can't be used.");
+    };
+
+    // Is it a backup, is it this iPod's, and can it be read?
+    let control = match backup::locate(&folder) {
+        Ok(control) => control,
+        Err(error) => return show_error(context, "That Isn't a Backup", &capitalized(&error.to_string())),
+    };
+    if control.starts_with(mount_path) {
+        return show_error(
+            context,
+            "Choose a Backup on Your Computer",
+            "That backup is stored on the iPod itself. Choose one that is stored on your computer.",
+        );
+    }
+    let ipod_control = mount_path.join("iPod_Control");
+    if let (Some(theirs), Some(ours)) = (backup::ipod_id(&control), backup::ipod_id(&ipod_control))
+        && theirs != ours
+    {
+        return show_error(
+            context,
+            "That Backup Is From a Different iPod",
+            "This backup was made from another iPod. Putting it on this one would give it a song list for songs that aren't here.",
+        );
+    }
+    let contents = match backup::contents(&control) {
+        Ok(contents) => contents,
+        Err(error) => {
+            let message = format!("{}. The backup may be damaged.", capitalized(&error.to_string()));
+            return show_error(context, "Can't Read That Backup", &message);
+        }
+    };
+    let items = match backup::restore_plan(&control) {
+        Ok(items) => items,
+        Err(error) => return show_error(context, "Can't Read That Backup", &capitalized(&error.to_string())),
+    };
+    let total: u64 = items.iter().map(|item| item.size).sum();
+    let needed = backup::space_needed(&items, mount_path);
+    if let Some(free) = device::free_space(mount_path)
+        && free < needed
+    {
+        let message = format!(
+            "Putting the backup back needs {} free on the iPod, and it has {}. Delete some songs first.",
+            glib::format_size(needed),
+            glib::format_size(free)
+        );
+        return show_error(context, "Not Enough Room on the iPod", &message);
+    }
+
+    // Ask. The folder's name tells when the backup was made.
+    let backup_name = folder.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let now = backup::contents(&ipod_control).ok();
+    let dialog = adw::AlertDialog::new(Some("Restore This Backup?"), Some(&restore_question(&backup_name, &contents, now.as_ref())));
+    dialog.add_responses(&[("cancel", "Cancel"), ("restore", "Restore")]);
+    dialog.set_response_appearance("restore", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    if dialog.choose_future(Some(&context.window)).await != "restore" {
+        return;
+    }
+
+    // Save what is on the iPod now. If that fails or is cancelled, the iPod hasn't been touched.
+    let safety = match make_backup(context, mount_path, name, BackupKind::BeforeRestore).await {
+        BackupResult::Done(done) => done,
+        BackupResult::Cancelled => return,
+        BackupResult::Failed(message) => {
+            let message = format!("{}\n\nNothing was changed on the iPod.", capitalized(&message));
+            return show_error(context, "Couldn't Save the iPod's Current State", &message);
+        }
+    };
+    // A copy of the iPod was just made: no need to offer another one when it is opened.
+    context.backed_up.borrow_mut().insert(mount_path.to_path_buf());
+
+    let copied = Arc::new(AtomicU64::new(0));
+    let progress = Progress::show(context, "Restoring…", total, &copied, None);
+    let result = gio::spawn_blocking({
+        let (ipod, copied) = (mount_path.to_path_buf(), copied.clone());
+        move || backup::restore(&control, &items, &ipod, &copied)
+    })
+    .await;
+    progress.finish();
+
+    let safety_name = safety.folder.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    match result {
+        Ok(Ok(restored)) => show_restored(context, mount_path.to_path_buf(), &contents, &restored, safety.folder),
+        Ok(Err(error)) => {
+            let message = format!(
+                "{}.\n\nThe iPod may be part way between how it was and the backup. Restoring the backup \
+                 again finishes the job. What was on the iPod before is saved in the folder “{safety_name}”.",
+                capitalized(&error.to_string())
+            );
+            show_error(context, "Couldn't Finish Restoring the Backup", &message);
+        }
+        Err(_) => show_error(context, "Couldn't Finish Restoring the Backup", "The restore crashed."),
+    }
+}
+
+/// What the question before a restore says: what is in the backup, what is on
+/// the iPod now, what changes, and that a copy of the iPod is saved first.
+fn restore_question(backup_name: &str, backup: &backup::Contents, ipod_now: Option<&backup::Contents>) -> String {
+    let ipod = match ipod_now {
+        Some(now) => format!("The iPod has {} now.", counted(now.songs, "song")),
+        None => "The iPod's own song list can't be read right now.".to_string(),
+    };
+    format!(
+        "“{backup_name}” has {} and {}. {ipod}\n\n\
+         Oxipod puts the backup's song list and covers on the iPod. Songs added since the backup are gone from \
+         the list (their files stay on the iPod, and Oxipod offers to clean them up). Songs deleted since then \
+         are in the list again, but their files are gone (Oxipod offers to remove them from the list).\n\n\
+         First Oxipod saves what is on the iPod now, in a folder you choose, so this can be undone.",
+        counted(backup.songs, "song"),
+        counted(backup.playlists, "playlist"),
+    )
+}
+
+/// Says that the backup is back, and where the copy of the old state is.
+fn show_restored(
+    context: &Context,
+    mount_path: PathBuf,
+    contents: &backup::Contents,
+    restored: &backup::Restored,
+    safety: PathBuf,
+) {
+    let safety_name = safety.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let body = format!(
+        "The iPod's song list is back to how it was in the backup: {}, {} ({}, {}, put back). What was on the iPod \
+         before is saved in the folder “{safety_name}”.",
+        counted(contents.songs, "song"),
+        counted(contents.playlists, "playlist"),
+        counted(restored.files, "file"),
+        glib::format_size(restored.bytes)
+    );
+    let dialog = adw::AlertDialog::new(Some("Backup Restored"), Some(&body));
+    dialog.add_responses(&[("show", "Show Saved Copy"), ("close", "Close"), ("open", "Open iPod")]);
+    dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("open"));
+    dialog.set_close_response("close");
+
+    let context_for_response = context.clone();
+    dialog.connect_response(None, move |_, response| {
+        let context = &context_for_response;
+        match response {
+            "show" => show_folder(context, &safety),
+            "open" => open_ipod_soon(context, mount_path.clone(), |_| {}),
+            _ => {}
+        }
+    });
+    dialog.present(Some(&context.window));
+}
+
+/// "1 song", "2 songs".
+fn counted(count: usize, noun: &str) -> String {
+    if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") }
+}
+
+/// The text with a capital first letter. Error messages from the code below
+/// are written to follow "Couldn't …:", so they start with a small letter.
+fn capitalized(text: &str) -> String {
+    let mut letters = text.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => String::new(),
+    }
 }
 
 /// Asks for a new name for an iPod and renames it. `reload` rebuilds the
@@ -739,4 +1002,38 @@ fn ask_new_name(
     });
     dialog.present(Some(window));
     entry.grab_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_with_the_right_plural() {
+        assert_eq!(counted(0, "song"), "0 songs");
+        assert_eq!(counted(1, "song"), "1 song");
+        assert_eq!(counted(407, "playlist"), "407 playlists");
+    }
+
+    #[test]
+    fn starts_error_messages_with_a_capital() {
+        assert_eq!(capitalized("there is no backup in this folder"), "There is no backup in this folder");
+        assert_eq!(capitalized("Already fine"), "Already fine");
+        assert_eq!(capitalized("épée"), "Épée");
+        assert_eq!(capitalized(""), "");
+    }
+
+    #[test]
+    fn the_restore_question_says_what_is_in_the_backup_and_on_the_ipod() {
+        let backup = backup::Contents { name: Some("Nyxnet's iPod".into()), songs: 407, playlists: 1 };
+        let now = backup::Contents { name: None, songs: 403, playlists: 0 };
+        let text = restore_question("Nyxnet's iPod backup 2026-10-15 1306", &backup, Some(&now));
+        assert!(text.starts_with("“Nyxnet's iPod backup 2026-10-15 1306” has 407 songs and 1 playlist. The iPod has 403 songs now."), "{text}");
+        assert!(text.contains("saves what is on the iPod now"), "{text}");
+
+        // An iPod whose own song list can't be read is a good reason to restore, so say so and go on.
+        let text = restore_question("backup", &backup, None);
+        assert!(text.contains("The iPod's own song list can't be read right now."), "{text}");
+        assert!(!text.contains("403"), "{text}");
+    }
 }

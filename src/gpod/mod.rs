@@ -611,6 +611,20 @@ impl Database {
         orphans
     }
 
+    /// Songs the database lists whose files are not on the iPod: the opposite
+    /// of `orphaned_files`. A restored backup lists the songs that were deleted
+    /// after it was made, for example. The iPod can't play them.
+    pub fn missing_songs(&self) -> Vec<TrackId> {
+        self.track_ptrs()
+            .into_iter()
+            // SAFETY: the tracks belong to the database. `filename_on_ipod` is
+            // None when the file isn't there (libgpod looks for it).
+            .filter(|&track| unsafe { filename_on_ipod(track) }.is_none())
+            // SAFETY: as above.
+            .map(|track| unsafe { (*track).dbid })
+            .collect()
+    }
+
     /// iPod_Control/Music, with the capitalisation used on this iPod.
     fn music_dir(&self) -> Option<PathBuf> {
         // SAFETY: the mount point is owned by the database. itdb_get_music_dir
@@ -939,6 +953,7 @@ mod tests {
             let file = db.track_file(track.id).expect("the song has a file");
             assert_eq!(u64::from(track.size), std::fs::metadata(&file).unwrap().len(), "{:?}", track.title);
         }
+        assert!(db.missing_songs().is_empty(), "every song on this iPod has its file");
         let with_cover = tracks.iter().filter(|track| track.has_cover).count();
         let with_album_artist = tracks.iter().filter(|track| track.album_artist.is_some()).count();
         let multi_disc = tracks.iter().filter(|track| track.disc_count > 1).count();
@@ -1142,6 +1157,20 @@ mod tests {
         }
     }
 
+    /// Gives the pretend database a folder to be "mounted" at, and each song a
+    /// file name (":iPod_Control:Music:F00:SONG1.mp3" and so on).
+    fn put_on_pretend_ipod(db: &Database, mount: &Path) {
+        let mount = path_to_c(mount).unwrap();
+        // SAFETY: the database owns a copy of the mount point after the call; the
+        // tracks belong to it, and the path strings are made with g_strdup as libgpod expects.
+        unsafe {
+            ffi::itdb_set_mountpoint(db.raw(), mount.as_ptr());
+            for (n, track) in db.track_ptrs().into_iter().enumerate() {
+                (*track).ipod_path = glib_string(Some(&format!(":iPod_Control:Music:F00:SONG{}.mp3", n + 1)));
+            }
+        }
+    }
+
     /// Whether a song's artist has a sort name.
     fn has_sort_artist(db: &Database, id: TrackId) -> bool {
         // SAFETY: the track belongs to the database.
@@ -1200,6 +1229,27 @@ mod tests {
         let tags = Tags { artist: Some("Changed".into()), ..Tags::default() };
         assert!(db.set_tags(&[1, 99], &tags).is_err());
         assert_eq!(track(&db, 1).artist.as_deref(), Some("Artist A"));
+    }
+
+    #[test]
+    fn finds_the_songs_whose_files_are_gone() {
+        let db = pretend_database();
+        let folder = tempfile::tempdir().unwrap();
+        let music = folder.path().join("iPod_Control/Music/F00");
+        std::fs::create_dir_all(&music).unwrap();
+        put_on_pretend_ipod(&db, folder.path());
+
+        // No file is there yet: all three songs are listed without their file.
+        let mut missing = db.missing_songs();
+        missing.sort();
+        assert_eq!(missing, vec![1, 2, 3]);
+
+        // Two of the files come back (the iPod doesn't mind capitals: SONG1.mp3 is found as song1.MP3).
+        std::fs::write(music.join("SONG1.mp3"), "music").unwrap();
+        std::fs::write(music.join("song3.MP3"), "music").unwrap();
+        assert_eq!(db.missing_songs(), vec![2]);
+        std::fs::write(music.join("SONG2.mp3"), "music").unwrap();
+        assert!(db.missing_songs().is_empty());
     }
 
     #[test]

@@ -69,6 +69,8 @@ pub struct Library {
     cancel_button: gtk::Button,
     /// Offers to delete files the database doesn't know about.
     leftovers_banner: adw::Banner,
+    /// Songs that are in the list but whose files are gone.
+    missing_banner: adw::Banner,
     /// Says the iPod can't be changed, when that is so.
     read_only_banner: adw::Banner,
     /// True when the iPod is mounted read-only: it can be looked at and copied
@@ -348,6 +350,7 @@ impl Library {
         toasts.set_child(Some(&tabs));
 
         let leftovers_banner = adw::Banner::builder().button_label("Clean Up…").build();
+        let missing_banner = adw::Banner::builder().button_label("Remove from List…").build();
         let read_only_banner = adw::Banner::builder()
             .title("This iPod is read-only, so Oxipod can look at it but not change it")
             .button_label("Why?")
@@ -358,6 +361,7 @@ impl Library {
         toolbar.add_top_bar(&header);
         toolbar.add_top_bar(&read_only_banner);
         toolbar.add_top_bar(&leftovers_banner);
+        toolbar.add_top_bar(&missing_banner);
         toolbar.set_content(Some(&toasts));
         toolbar.add_bottom_bar(&bottom_bar);
         toolbar.set_reveal_bottom_bars(false);
@@ -413,6 +417,7 @@ impl Library {
                 selection_more_button,
                 cancel_button,
                 leftovers_banner,
+                missing_banner,
                 read_only_banner,
                 read_only: access.read_only,
                 filesystem: access.filesystem,
@@ -438,6 +443,7 @@ impl Library {
         }
         library.refresh();
         library.check_leftovers();
+        library.check_missing();
         Ok(library)
     }
 
@@ -514,6 +520,13 @@ impl Library {
         self.leftovers_banner.connect_button_clicked(move |_| {
             if let Some(this) = this.upgrade() {
                 this.confirm_delete_leftovers();
+            }
+        });
+
+        let this = Rc::downgrade(self);
+        self.missing_banner.connect_button_clicked(move |_| {
+            if let Some(this) = this.upgrade() {
+                this.confirm_remove_missing();
             }
         });
 
@@ -1674,6 +1687,66 @@ impl Library {
             glib::format_size(size)
         ));
         self.leftovers_banner.set_revealed(true);
+    }
+
+    /// Shows the banner about songs whose files are gone from the iPod, if
+    /// there are any. (The iPod can't play them. After restoring a backup
+    /// they are the songs that were deleted after it was made.)
+    fn check_missing(&self) {
+        // Taking them out of the list changes the iPod, which a read-only one doesn't allow.
+        if self.read_only {
+            return;
+        }
+        let missing = self.db.borrow().missing_songs();
+        if missing.is_empty() {
+            self.missing_banner.set_revealed(false);
+            return;
+        }
+        self.missing_banner.set_title(&format!(
+            "{} {} in the list but their {} gone from the iPod",
+            songs_count(missing.len()),
+            if missing.len() == 1 { "is" } else { "are" },
+            if missing.len() == 1 { "file is" } else { "files are" },
+        ));
+        self.missing_banner.set_revealed(true);
+    }
+
+    fn confirm_remove_missing(self: &Rc<Self>) {
+        if self.busy.get() {
+            return;
+        }
+        let count = self.db.borrow().missing_songs().len();
+        let dialog = adw::AlertDialog::new(
+            Some("Remove These Songs From the List?"),
+            Some(&format!(
+                "{} {} in the iPod's song list, but the files are gone, so the iPod can't play {}. \
+                 This takes {} out of the list. Nothing else changes.",
+                songs_count(count),
+                if count == 1 { "is" } else { "are" },
+                if count == 1 { "it" } else { "them" },
+                if count == 1 { "it" } else { "them" },
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
+        dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let this = Rc::downgrade(self);
+        dialog.connect_response(Some("remove"), move |_, _| {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            // Look again: only remove what is still missing right now.
+            let missing = this.db.borrow().missing_songs();
+            // The files are gone already, so removing a song only takes it out of the lists.
+            let saved = this.change(|db| missing.iter().try_for_each(|&id| db.remove_track(id)));
+            this.check_missing();
+            if saved {
+                this.toast(&format!("Removed {} from the list", songs_count(missing.len())));
+            }
+        });
+        dialog.present(Some(&self.page));
     }
 
     fn confirm_delete_leftovers(self: &Rc<Self>) {
