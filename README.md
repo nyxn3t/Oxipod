@@ -1,4 +1,4 @@
-# Oxipod
+# <img src="data/icons/hicolor/scalable/apps/io.github.nyxn3t.Oxipod.svg" width="48" height="48" align="absmiddle" alt=""> Oxipod
 
 Put music on your old iPod from Linux.
 
