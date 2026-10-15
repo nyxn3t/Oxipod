@@ -10,6 +10,7 @@ mod library;
 mod settings;
 mod songs;
 mod sysinfo;
+mod tags;
 mod udisks;
 
 use std::cell::{Cell, RefCell};

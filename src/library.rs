@@ -19,6 +19,7 @@ use crate::export::{self, Layout, Outcome};
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
 use crate::settings::Settings;
 use crate::songs::{SongFilter, SongList, SortMode, show_cover};
+use crate::tags;
 
 /// Shown at this size in the song list.
 pub const COVER_SIZE: i32 = 40;
@@ -316,12 +317,15 @@ impl Library {
         let select_all_button = gtk::Button::with_label("Select All");
         let selection_copy_button = gtk::Button::with_label("Copy to Computer");
         let selection_more_menu = gio::Menu::new();
-        selection_more_menu.append(Some("Choose Cover…"), Some("library.choose-cover-selected"));
-        selection_more_menu.append(Some("Remove Cover"), Some("library.remove-cover-selected"));
+        selection_more_menu.append(Some("Edit Tags…"), Some("library.edit-tags-selected"));
+        let selection_covers_menu = gio::Menu::new();
+        selection_covers_menu.append(Some("Choose Cover…"), Some("library.choose-cover-selected"));
+        selection_covers_menu.append(Some("Remove Cover"), Some("library.remove-cover-selected"));
+        selection_more_menu.append_section(None, &selection_covers_menu);
         let selection_more_button = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
             .menu_model(&selection_more_menu)
-            .tooltip_text("Covers")
+            .tooltip_text("More")
             .build();
         let selection_add_button = gtk::MenuButton::builder().label("Add to Playlist").build();
         let selection_delete_button = gtk::Button::builder()
@@ -463,6 +467,8 @@ impl Library {
             "remove-cover",
             "choose-cover-selected",
             "remove-cover-selected",
+            "edit-tags",
+            "edit-tags-selected",
             "select-extra-copies",
             "new-playlist-with-song",
             "add-selected-to-playlist",
@@ -673,6 +679,8 @@ impl Library {
         self.add_action::<TrackId>("remove-cover", |this, id| this.remove_covers(vec![id]));
         self.add_action::<()>("choose-cover-selected", |this, ()| this.choose_cover(this.selected_ids()));
         self.add_action::<()>("remove-cover-selected", |this, ()| this.remove_covers(this.selected_ids()));
+        self.add_action::<TrackId>("edit-tags", |this, id| this.edit_tags(vec![id]));
+        self.add_action::<()>("edit-tags-selected", |this, ()| this.edit_tags(this.selected_ids()));
         self.add_action::<()>("select-extra-copies", |this, ()| this.select_extra_copies());
         self.add_action::<TrackId>("new-playlist-with-song", |this, id| {
             this.ask_playlist_name(vec![id]);
@@ -1480,6 +1488,32 @@ impl Library {
         }
     }
 
+    /// Asks for new tags for these songs, then changes them on the iPod.
+    fn edit_tags(self: &Rc<Self>, ids: Vec<TrackId>) {
+        if self.busy.get() {
+            self.toast("Wait until the current job is done");
+            return;
+        }
+        let wanted: HashSet<TrackId> = ids.into_iter().collect();
+        let songs: Vec<Track> = self.db.borrow().tracks().into_iter().filter(|track| wanted.contains(&track.id)).collect();
+        if songs.is_empty() {
+            return;
+        }
+        let ids: Vec<TrackId> = songs.iter().map(|song| song.id).collect();
+        let this = Rc::downgrade(self);
+        tags::show(&self.page, &songs, move |tags| {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            if this.change(|db| db.set_tags(&ids, &tags)) {
+                this.toast(&match ids.as_slice() {
+                    [_] => "Changed the tags".to_string(),
+                    _ => format!("Changed the tags of {}", songs_count(ids.len())),
+                });
+            }
+        });
+    }
+
     /// Throws away the covers loaded for these songs, so they're read again.
     fn forget_covers(&self, ids: &[TrackId]) {
         let mut covers = self.covers.borrow_mut();
@@ -2070,8 +2104,11 @@ fn song_menu(track: &Track, has_cover: bool, playlists: &[gpod::Playlist], in_pl
     copy.set_action_and_target_value(Some("library.copy-song"), Some(&id.to_variant()));
     menu.append_item(&copy);
 
-    // Everything about the song's cover, in a section of its own.
+    // Changing the song itself, in a section of its own: its tags and its cover.
     let covers = gio::Menu::new();
+    let edit = gio::MenuItem::new(Some("Edit Tags…"), None);
+    edit.set_action_and_target_value(Some("library.edit-tags"), Some(&id.to_variant()));
+    covers.append_item(&edit);
     let choose = gio::MenuItem::new(Some("Choose Cover…"), None);
     choose.set_action_and_target_value(Some("library.choose-cover"), Some(&id.to_variant()));
     covers.append_item(&choose);
@@ -2114,7 +2151,7 @@ fn selection_menu(playlists: &[gpod::Playlist]) -> gio::Menu {
     menu
 }
 
-fn boxed_list(placeholder: &str) -> gtk::ListBox {
+pub fn boxed_list(placeholder: &str) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])

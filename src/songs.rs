@@ -58,6 +58,17 @@ impl Song {
         words.iter().all(|word| self.haystack.contains(word.as_str()))
     }
 
+    /// Whether `track` has other texts than this song: its tags were edited.
+    /// What was worked out from them for the search and the sort is out of
+    /// date then. (The cover isn't a tag: it has its own way of changing.)
+    fn tags_differ(&self, track: &Track) -> bool {
+        let mine = &self.track;
+        mine.title != track.title
+            || mine.artist != track.artist
+            || mine.album != track.album
+            || mine.album_artist != track.album_artist
+    }
+
     /// Where the song sits on its album: by disc, then by track number. Songs
     /// that don't say come last.
     fn position(&self) -> (i32, i32) {
@@ -235,6 +246,18 @@ impl SongObject {
         object.imp().has_cover.set(track.has_cover);
         assert!(object.imp().song.set(Song::new(track)).is_ok(), "a new object has no song yet");
         object
+    }
+
+    /// A new object for the same song after its tags were edited. A `Song`
+    /// can't change, so the keys for the search and the sort are made again in
+    /// a new one. What belongs to the song and not to its tags comes along.
+    fn with_track(&self, track: Track) -> Self {
+        let new = SongObject::new(track);
+        new.set_selected(self.selected());
+        new.set_cover(self.cover().as_ref());
+        new.imp().cover_requested.set(self.imp().cover_requested.get());
+        new.imp().duplicate.set(self.imp().duplicate.get());
+        new
     }
 
     /// Whether the iPod has cover art for the song, right now.
@@ -451,16 +474,26 @@ impl SongList {
         let wanted: HashMap<TrackId, &Track> = tracks.iter().map(|track| (track.id, track)).collect();
         let mut present = HashSet::new();
         let mut gone = Vec::new();
+        let mut retagged = Vec::new();
         let mut covers_changed = false;
         for (position, song) in songs_in(&self.store).enumerate() {
             match wanted.get(&song.id()) {
                 Some(track) => {
                     present.insert(song.id());
-                    // A song that stays can still have got or lost its cover.
+                    // A song that stays can still have got or lost its cover...
                     covers_changed |= song.set_has_cover(track.has_cover);
+                    // ...or had its tags edited, and then it gets a new object.
+                    if song.song().tags_differ(track) {
+                        retagged.push((position as u32, self.watched(song.with_track((*track).clone()))));
+                    }
                 }
                 None => gone.push(position as u32),
             }
+        }
+        // The new object takes the old one's place, so no position moves. The
+        // filter and the sorter see an object come and go and put it where it belongs.
+        for (position, song) in retagged {
+            self.store.splice(position, 1, &[song]);
         }
         // Remove from the back, so the positions still to be removed don't shift.
         for position in gone.into_iter().rev() {
@@ -470,12 +503,7 @@ impl SongList {
         let new_songs: Vec<SongObject> = tracks
             .iter()
             .filter(|track| !present.contains(&track.id))
-            .map(|track| {
-                let song = SongObject::new(track.clone());
-                let notifier = self.selection_changed.clone();
-                song.connect_selected_notify(move |_| notifier.poke());
-                song
-            })
+            .map(|track| self.watched(SongObject::new(track.clone())))
             .collect();
         self.store.extend_from_slice(&new_songs);
 
@@ -501,6 +529,13 @@ impl SongList {
         if duplicates_changed && filter == SongFilter::Duplicates {
             self.sorter.changed(gtk::SorterChange::Different);
         }
+    }
+
+    /// Makes the list notice when this song is ticked or unticked.
+    fn watched(&self, song: SongObject) -> SongObject {
+        let notifier = self.selection_changed.clone();
+        song.connect_selected_notify(move |_| notifier.poke());
+        song
     }
 
     /// The covers of these songs were changed on the iPod: forget the pictures
@@ -892,6 +927,27 @@ mod tests {
     }
 
     #[test]
+    fn notices_when_the_tags_were_edited() {
+        let song = song(1, "Title", "Artist", "Album", 1, 1, 0);
+        let mut edited = song.track.clone();
+        assert!(!song.tags_differ(&edited));
+        for change in [
+            |track: &mut Track| track.title = Some("Other Title".into()),
+            |track: &mut Track| track.artist = None,
+            |track: &mut Track| track.album = Some("Other Album".into()),
+            |track: &mut Track| track.album_artist = Some("Various Artists".into()),
+        ] {
+            edited = song.track.clone();
+            change(&mut edited);
+            assert!(song.tags_differ(&edited), "{edited:?}");
+        }
+        // A cover is not a tag: it has its own way of changing.
+        edited = song.track.clone();
+        edited.has_cover = true;
+        assert!(!song.tags_differ(&edited));
+    }
+
+    #[test]
     fn sorts_by_title_ignoring_case() {
         let mut songs = [
             song(1, "banana", "", "", 0, 0, 0),
@@ -1106,6 +1162,26 @@ mod tests {
         list.clear_selection();
         settle();
         assert_eq!(list.stats().selected, 0);
+
+        // Editing a song's tags: the song is found under its new text and not
+        // under the old one, and its tick stays with it.
+        list.set_query("song 00000");
+        assert_eq!(list.stats().shown, 1);
+        list.select_shown(true);
+        assert_eq!(list.selected_ids(), vec![1]);
+        let mut edited = tracks.clone();
+        edited[0].title = Some("Zebra Moon".into());
+        list.set_tracks(&edited);
+        settle();
+        assert_eq!(list.stats().shown, 0, "the old title doesn't find the song any more");
+        list.set_query("zebra moon");
+        settle();
+        assert_eq!(list.stats().shown, 1);
+        assert_eq!(list.selected_ids(), vec![1], "the tick came along");
+        assert_eq!(list.stats().total, 20_000);
+        list.clear_selection();
+        list.set_query("");
+        settle();
         window.close();
 
         check_the_filters(&button);

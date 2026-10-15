@@ -130,6 +130,24 @@ pub struct NewTrack {
     pub cover: Option<Vec<u8>>,
 }
 
+/// New texts for the tags of some songs (see `Database::set_tags`). A field
+/// that is `None` stays as it is; an empty text empties it (except the title,
+/// which a song can't be without).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+}
+
+impl Tags {
+    /// Whether nothing is to be changed.
+    pub fn is_empty(&self) -> bool {
+        *self == Tags::default()
+    }
+}
+
 /// A song that is in the database but whose file still has to be copied to
 /// `destination` on the iPod. Finish with `finish_copy` or `cancel_copy`.
 #[derive(Debug)]
@@ -327,6 +345,44 @@ impl Database {
             let track = self.find_track(id)?;
             // SAFETY: `track` belongs to the database.
             unsafe { ffi::itdb_track_remove_thumbnails(track) };
+        }
+        Ok(())
+    }
+
+    /// Changes the title, artist, album and album artist of these songs: the
+    /// fields `tags` has a value for, the others stay as they are. The changes
+    /// reach the iPod with the next `save`. Only the database changes. The tags
+    /// inside the song files don't, and the iPod doesn't read them: it shows
+    /// what the database says.
+    pub fn set_tags(&mut self, ids: &[TrackId], tags: &Tags) -> Result<(), Error> {
+        if tags.title.as_deref().is_some_and(|title| title.trim().is_empty()) {
+            return Err(Error::new("a song needs a title"));
+        }
+        // Look every song up before changing any, so that a missing one changes nothing.
+        let songs = ids.iter().map(|&id| self.find_track(id)).collect::<Result<Vec<_>, _>>()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        for track in songs {
+            // SAFETY: `track` belongs to the database, and its text fields are
+            // NULL or strings allocated by glib, which is what `replace_text` needs.
+            unsafe {
+                let track = &mut *track;
+                let mut changed = false;
+                if let Some(title) = &tags.title {
+                    changed |= replace_text(&mut track.title, &mut track.sort_title, title);
+                }
+                if let Some(artist) = &tags.artist {
+                    changed |= replace_text(&mut track.artist, &mut track.sort_artist, artist);
+                }
+                if let Some(album) = &tags.album {
+                    changed |= replace_text(&mut track.album, &mut track.sort_album, album);
+                }
+                if let Some(album_artist) = &tags.album_artist {
+                    changed |= replace_text(&mut track.albumartist, &mut track.sort_albumartist, album_artist);
+                }
+                if changed {
+                    track.time_modified = now as ffi::time_t;
+                }
+            }
         }
         Ok(())
     }
@@ -764,6 +820,30 @@ fn glib_string(text: Option<&str>) -> *mut c_char {
     unsafe { ffi::g_strdup(text.as_ptr()) }
 }
 
+/// Puts `text` (without the spaces around it) in one of a track's text fields,
+/// and empties the field's sort name: that was made for the old text, and the
+/// iPod would go on sorting by it. Empty text means no text (NULL). Says
+/// whether anything changed; a field that has this text already is left alone,
+/// sort name included.
+///
+/// # Safety
+/// Both fields must be NULL or strings allocated by glib (libgpod frees them
+/// with g_free).
+unsafe fn replace_text(field: &mut *mut c_char, sort_field: &mut *mut c_char, text: &str) -> bool {
+    let text = text.trim();
+    // SAFETY: guaranteed by the caller.
+    unsafe {
+        if string_from_c(*field).as_deref().unwrap_or_default() == text {
+            return false;
+        }
+        ffi::g_free((*field).cast());
+        ffi::g_free((*sort_field).cast());
+    }
+    *field = glib_string(Some(text).filter(|text| !text.is_empty()));
+    *sort_field = ptr::null_mut();
+    true
+}
+
 fn path_to_c(path: &Path) -> Result<CString, Error> {
     // C wants a nul-terminated string; a path with a nul byte in it can't be
     // passed to C at all.
@@ -1034,6 +1114,157 @@ mod tests {
         let found = db.orphaned_files();
         std::fs::remove_file(&fake).unwrap();
         assert_eq!(found, vec![(fake, 16)]);
+    }
+
+    /// A database that isn't on any iPod, with three songs in it (ids 1 to 3).
+    /// Every song has the sort name "old sort name" for its artist.
+    fn pretend_database() -> Database {
+        // SAFETY: itdb_new makes an empty database that only we own. The tracks
+        // are handed over to it with itdb_track_add, their strings made by
+        // g_strdup (glib_string) as libgpod wants.
+        unsafe {
+            let raw = NonNull::new(ffi::itdb_new()).expect("itdb_new works");
+            let db = Database { raw };
+            for (id, (title, artist, album)) in
+                [("Song One", "Artist A", "Album X"), ("Song Two", "Artist A", "Album X"), ("Song Three", "Artist B", "")]
+                    .into_iter()
+                    .enumerate()
+            {
+                let track = ffi::itdb_track_new();
+                (*track).title = glib_string(Some(title));
+                (*track).artist = glib_string(Some(artist));
+                (*track).album = glib_string(Some(album).filter(|album| !album.is_empty()));
+                (*track).sort_artist = glib_string(Some("old sort name"));
+                ffi::itdb_track_add(db.raw(), track, -1);
+                (*track).dbid = id as u64 + 1;
+            }
+            db
+        }
+    }
+
+    /// Whether a song's artist has a sort name.
+    fn has_sort_artist(db: &Database, id: TrackId) -> bool {
+        // SAFETY: the track belongs to the database.
+        unsafe { !(*db.find_track(id).unwrap()).sort_artist.is_null() }
+    }
+
+    fn track(db: &Database, id: TrackId) -> Track {
+        db.tracks().into_iter().find(|track| track.id == id).unwrap()
+    }
+
+    #[test]
+    fn changes_only_the_tags_it_is_given() {
+        let mut db = pretend_database();
+        let tags = Tags { artist: Some("New Artist".into()), album: Some("New Album".into()), ..Tags::default() };
+        db.set_tags(&[1, 2], &tags).unwrap();
+
+        for id in [1, 2] {
+            let song = track(&db, id);
+            assert_eq!(song.artist.as_deref(), Some("New Artist"));
+            assert_eq!(song.album.as_deref(), Some("New Album"));
+            assert!(!has_sort_artist(&db, id), "the sort name belonged to the old artist");
+        }
+        assert_eq!(track(&db, 1).title.as_deref(), Some("Song One"), "the title wasn't given");
+        // The song that wasn't named stays as it was.
+        assert_eq!(track(&db, 3).artist.as_deref(), Some("Artist B"));
+        assert!(has_sort_artist(&db, 3));
+    }
+
+    #[test]
+    fn empty_text_empties_a_tag_and_spaces_are_trimmed() {
+        let mut db = pretend_database();
+        let tags = Tags { title: Some("  Renamed  ".into()), album: Some(String::new()), ..Tags::default() };
+        db.set_tags(&[1], &tags).unwrap();
+        let song = track(&db, 1);
+        assert_eq!(song.title.as_deref(), Some("Renamed"));
+        assert_eq!(song.album, None);
+        assert_eq!(song.artist.as_deref(), Some("Artist A"));
+    }
+
+    #[test]
+    fn the_same_text_keeps_the_sort_name() {
+        let mut db = pretend_database();
+        let tags = Tags { artist: Some("Artist A".into()), ..Tags::default() };
+        db.set_tags(&[1], &tags).unwrap();
+        assert!(has_sort_artist(&db, 1), "nothing changed, so the sort name is still right");
+    }
+
+    #[test]
+    fn a_song_cannot_lose_its_title_or_be_missing() {
+        let mut db = pretend_database();
+        let no_title = Tags { title: Some("   ".into()), artist: Some("Changed".into()), ..Tags::default() };
+        assert!(db.set_tags(&[1], &no_title).is_err());
+        assert_eq!(track(&db, 1).artist.as_deref(), Some("Artist A"), "a refused change changes nothing");
+
+        // One of the songs doesn't exist: the one that does is left alone too.
+        let tags = Tags { artist: Some("Changed".into()), ..Tags::default() };
+        assert!(db.set_tags(&[1, 99], &tags).is_err());
+        assert_eq!(track(&db, 1).artist.as_deref(), Some("Artist A"));
+    }
+
+    #[test]
+    fn knows_when_there_is_nothing_to_change() {
+        assert!(Tags::default().is_empty());
+        assert!(!Tags { album: Some(String::new()), ..Tags::default() }.is_empty());
+    }
+
+    // Changes the tags of one song, checks them after reopening the database,
+    // and puts the old ones back. Run with OXIPOD_TEST_IPOD set. Writes to the
+    // iPod, but leaves it as it was (the song has no sort names to lose).
+    #[test]
+    #[ignore = "writes to a mounted iPod"]
+    fn edits_the_tags_of_a_song_and_back() {
+        let mount = std::env::var("OXIPOD_TEST_IPOD").expect("OXIPOD_TEST_IPOD is not set");
+        let path = Path::new(&mount);
+        let mut db = Database::open(path).expect("could not open the database");
+        let before = db.tracks();
+        // A song without sort names, so putting its text back leaves it exactly as it was.
+        let song = before
+            .iter()
+            .find(|song| {
+                // SAFETY: the track belongs to the database.
+                unsafe {
+                    let raw = &*db.find_track(song.id).unwrap();
+                    [raw.sort_title, raw.sort_artist, raw.sort_album, raw.sort_albumartist].iter().all(|sort| sort.is_null())
+                }
+            })
+            .expect("a song without sort names")
+            .clone();
+
+        let edited = Tags {
+            title: Some("Oxipod tag test".into()),
+            artist: Some("Oxipod Test Artist".into()),
+            album: Some(String::new()),
+            album_artist: Some("Oxipod Test Album Artist".into()),
+        };
+        db.set_tags(&[song.id], &edited).unwrap();
+        db.save().unwrap();
+        drop(db);
+
+        let mut db = Database::open(path).expect("could not reopen the database");
+        let saved = track(&db, song.id);
+        assert_eq!(saved.title.as_deref(), Some("Oxipod tag test"));
+        assert_eq!(saved.artist.as_deref(), Some("Oxipod Test Artist"));
+        assert_eq!(saved.album, None);
+        assert_eq!(saved.album_artist.as_deref(), Some("Oxipod Test Album Artist"));
+        assert_eq!(db.tracks().len(), before.len());
+
+        let original = Tags {
+            title: song.title.clone(),
+            artist: Some(song.artist.clone().unwrap_or_default()),
+            album: Some(song.album.clone().unwrap_or_default()),
+            album_artist: Some(song.album_artist.clone().unwrap_or_default()),
+        };
+        db.set_tags(&[song.id], &original).unwrap();
+        db.save().unwrap();
+        drop(db);
+
+        let db = Database::open(path).expect("could not reopen the database");
+        let restored = track(&db, song.id);
+        let same = |a: &Option<String>, b: &Option<String>| a.as_deref().map(str::trim) == b.as_deref().map(str::trim);
+        assert!(same(&restored.title, &song.title) && same(&restored.artist, &song.artist), "{restored:?}");
+        assert!(same(&restored.album, &song.album) && same(&restored.album_artist, &song.album_artist), "{restored:?}");
+        assert_eq!(db.tracks().len(), before.len());
     }
 
     #[test]
