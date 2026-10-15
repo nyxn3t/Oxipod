@@ -24,6 +24,9 @@ music on the window, and that's it.
 - Playlists: create them, add songs, remove songs
 - Delete songs from the iPod, or select a bunch and delete them or add them
   to a playlist in one go
+- Copy songs back to your computer with readable names like
+  `Artist - Title.mp3`, one at a time or a whole selection. Handy as a backup
+  too
 - Cleans up leftover files from syncs that got interrupted
 - Ejects the iPod when you're done
 

@@ -24,6 +24,7 @@
       <li>Search the songs and sort them by title, artist, album or date added</li>
       <li>Create playlists and add or remove songs</li>
       <li>Delete songs from the iPod, one at a time or several at once</li>
+      <li>Copy songs back to your computer with readable file names</li>
       <li>Finds and cleans up leftover files from interrupted syncs</li>
     </ul>
     <p>
@@ -37,8 +38,12 @@
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.3.0/data/screenshots/songs.png</image>
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.4.0/data/screenshots/songs.png</image>
       <caption>The songs on an iPod nano</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.4.0/data/screenshots/search.png</image>
+      <caption>Searching the songs</caption>
     </screenshot>
   </screenshots>
 
@@ -67,6 +72,17 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.4.0" date="2026-10-15">
+      <description>
+        <p>You can now copy songs from the iPod back to your computer.</p>
+        <ul>
+          <li>Copy to Computer in the menu of a song, or for a whole selection, with names like "Artist - Title.mp3"</li>
+          <li>Nothing gets overwritten, and songs that are already in the folder are skipped</li>
+          <li>The list of iPods no longer shows where the iPod is mounted</li>
+          <li>A softer placeholder for songs without cover art</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-10-15">
       <description>
         <p>The song list is a lot faster with big libraries, and you can now search and sort it.</p>
