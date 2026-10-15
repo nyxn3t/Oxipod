@@ -3,6 +3,7 @@ mod device;
 mod eject;
 mod gpod;
 mod library;
+mod songs;
 
 use std::cell::RefCell;
 use std::rc::Rc;

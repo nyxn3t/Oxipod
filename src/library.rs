@@ -2,7 +2,7 @@
 //! editing playlists, and ejecting.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
@@ -14,9 +14,10 @@ use gtk::{gdk, gio, glib};
 use crate::convert;
 use crate::eject;
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
+use crate::songs::SongList;
 
 /// Shown at this size in the song list.
-const COVER_SIZE: i32 = 40;
+pub const COVER_SIZE: i32 = 40;
 
 /// Space kept free on the iPod for the music and cover art databases, which
 /// grow with every song.
@@ -34,9 +35,6 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(10);
 /// `RefCell` (for anything else); both allow changing them through a shared
 /// reference, which Rust normally forbids.
 pub struct Library {
-    /// A reference to the library itself, for signal handlers created in
-    /// methods that only get `&self` (see `Rc::new_cyclic` in `new`).
-    this: Weak<Library>,
     db: RefCell<Database>,
     mount_path: PathBuf,
     page: adw::NavigationPage,
@@ -55,14 +53,15 @@ pub struct Library {
     select_all_button: gtk::Button,
     selection_add_button: gtk::MenuButton,
     selection_delete_button: gtk::Button,
-    /// The songs ticked in selection mode.
-    selected: RefCell<HashSet<TrackId>>,
-    /// The rows in the song list, in the order they're shown.
-    song_rows: RefCell<Vec<SongRow>>,
     /// Offers to delete files the database doesn't know about.
     leftovers_banner: adw::Banner,
-    songs_group: adw::PreferencesGroup,
-    songs: gtk::ListBox,
+    /// "35 Songs · 2h 5m" and the iPod's details, above the song list.
+    songs_title: gtk::Label,
+    songs_details: gtk::Label,
+    /// Switches between the song list and the "nothing here" pages.
+    songs_stack: gtk::Stack,
+    /// The songs, their order and their ticks (see `songs.rs`).
+    songs: SongList,
     playlists: gtk::ListBox,
     /// The playlist page that is open, if any, so it can be refreshed.
     open_playlist: RefCell<Option<OpenPlaylist>>,
@@ -79,14 +78,6 @@ enum ImportError {
     Stop(String),
 }
 
-/// A row in the song list and the widgets that change in selection mode.
-struct SongRow {
-    id: TrackId,
-    row: adw::ActionRow,
-    check: gtk::CheckButton,
-    menu_button: gtk::MenuButton,
-}
-
 struct OpenPlaylist {
     id: PlaylistId,
     page: adw::NavigationPage,
@@ -99,11 +90,48 @@ impl Library {
         let db = Database::open(mount_path)?;
         let name = db.name().unwrap_or_else(|| "iPod".into());
 
-        let songs = boxed_list("No songs yet. Drop music files here, or use the + button.");
-        let songs_group = adw::PreferencesGroup::new();
-        songs_group.add(&songs);
-        let songs_page = adw::PreferencesPage::new();
-        songs_page.add(&songs_group);
+        let select_button = gtk::ToggleButton::builder()
+            .icon_name("selection-mode-symbolic")
+            .tooltip_text("Select Songs")
+            .build();
+
+        // Above the list: how many songs and the iPod's details.
+        let songs_title = gtk::Label::builder().xalign(0.0).css_classes(["heading"]).build();
+        let songs_details = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["dim-label"]).build();
+        let heading_text = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        heading_text.append(&songs_title);
+        heading_text.append(&songs_details);
+
+        // The list itself is added to this stack once it exists (see below).
+        let songs_stack = gtk::Stack::builder().vexpand(true).build();
+        let empty_page = adw::StatusPage::builder()
+            .icon_name("folder-music-symbolic")
+            .title("No Songs Yet")
+            .description("Drop music files here, or use the + button.")
+            .build();
+        songs_stack.add_named(&empty_page, Some("empty"));
+
+        let songs_column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .vexpand(true)
+            .build();
+        songs_column.append(&heading_text);
+        songs_column.append(&songs_stack);
+        let songs_page = adw::Clamp::builder()
+            .maximum_size(600)
+            .tightening_threshold(400)
+            .child(&songs_column)
+            .build();
 
         let playlists = boxed_list("No playlists yet");
         let new_playlist_button = gtk::Button::builder()
@@ -128,10 +156,6 @@ impl Library {
         let eject_button = gtk::Button::builder()
             .icon_name("media-eject-symbolic")
             .tooltip_text("Eject")
-            .build();
-        let select_button = gtk::ToggleButton::builder()
-            .icon_name("selection-mode-symbolic")
-            .tooltip_text("Select Songs")
             .build();
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(
@@ -197,36 +221,54 @@ impl Library {
         page.insert_action_group("library", Some(&actions));
 
         // new_cyclic hands us a Weak reference to the Rc before it exists, so
-        // the library can store a reference to itself. A Weak one, because a
-        // strong one would keep it alive forever.
-        let library = Rc::new_cyclic(|this| Library {
-            this: this.clone(),
-            db: RefCell::new(db),
-            mount_path: mount_path.to_path_buf(),
-            page,
-            navigation: navigation.clone(),
-            actions,
-            toasts,
-            toolbar,
-            add_button,
-            eject_button,
-            progress,
-            progress_label,
-            bottom_bar,
-            select_button,
-            selection_label,
-            select_all_button,
-            selection_add_button,
-            selection_delete_button,
-            selected: RefCell::new(HashSet::new()),
-            song_rows: RefCell::new(Vec::new()),
-            leftovers_banner,
-            songs_group,
-            songs,
-            playlists,
-            open_playlist: RefCell::new(None),
-            covers: RefCell::new(HashMap::new()),
-            busy: Cell::new(false),
+        // things built along with the library (the song list) can keep a
+        // reference back to it. A Weak one, because a strong one would keep
+        // the library alive forever.
+        let library = Rc::new_cyclic(|this: &Weak<Library>| {
+            // The song list asks the library for covers and menus whenever a
+            // row needs one, so it gets (weak) references back to it.
+            let load_cover = {
+                let this = this.clone();
+                move |id| this.upgrade().and_then(|library| library.cover(id))
+            };
+            let song_menu = {
+                let this = this.clone();
+                move |id| match this.upgrade() {
+                    Some(library) => song_menu(id, &library.db.borrow().playlists(), None),
+                    None => gio::Menu::new(),
+                }
+            };
+            let songs = SongList::new(&select_button, load_cover, song_menu);
+            songs_stack.add_named(songs.widget(), Some("list"));
+
+            Library {
+                db: RefCell::new(db),
+                mount_path: mount_path.to_path_buf(),
+                page,
+                navigation: navigation.clone(),
+                actions,
+                toasts,
+                toolbar,
+                add_button,
+                eject_button,
+                progress,
+                progress_label,
+                bottom_bar,
+                select_button,
+                selection_label,
+                select_all_button,
+                selection_add_button,
+                selection_delete_button,
+                leftovers_banner,
+                songs_title,
+                songs_details,
+                songs_stack,
+                songs,
+                playlists,
+                open_playlist: RefCell::new(None),
+                covers: RefCell::new(HashMap::new()),
+                busy: Cell::new(false),
+            }
         });
 
         library.connect_signals(&new_playlist_button, &tabs);
@@ -298,6 +340,21 @@ impl Library {
             }
         });
 
+        // The song list tells us when its ticks or its songs changed.
+        let this = Rc::downgrade(self);
+        self.songs.connect_selection_changed(move || {
+            if let Some(this) = this.upgrade() {
+                this.update_selection_bar();
+            }
+        });
+        let this = Rc::downgrade(self);
+        self.songs.connect_shown_changed(move || {
+            if let Some(this) = this.upgrade() {
+                this.update_songs_view();
+                this.update_selection_bar();
+            }
+        });
+
         // Selecting is only for the song list: leave it on the Playlists tab,
         // and only show the button on the Songs tab.
         let this = Rc::downgrade(self);
@@ -330,7 +387,7 @@ impl Library {
             Some(gtk::CallbackAction::new(move |_, _| match this.upgrade() {
                 Some(this) if this.select_button.is_visible() && !this.busy.get() => {
                     this.select_button.set_active(true);
-                    this.select_all(true);
+                    this.songs.select_all(true);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -416,53 +473,24 @@ impl Library {
         self.actions.add_action(&action);
     }
 
-    /// Rebuilds every list from the database.
+    /// Brings every list up to date with the database.
     fn refresh(&self) {
         let db = self.db.borrow();
-        let mut tracks = db.tracks();
-        tracks.sort_by_key(sort_key);
+        let tracks = with_test_songs(db.tracks());
         let playlists = db.playlists();
         let info = db.device_info();
-        drop(db); // done reading; song_row borrows the database again
+        drop(db); // done reading; the song list asks for covers and menus, which borrow the database again
 
-        let total: Duration = tracks.iter().map(|track| track.length).sum();
-        self.songs_group
-            .set_title(&format!("{} Songs · {}", tracks.len(), format_duration(total)));
         let free = self.free_space().map(|bytes| format!("{} free", glib::format_size(bytes)));
         let details = [info.generation, info.model_number, free].into_iter().flatten().collect::<Vec<_>>();
-        self.songs_group.set_description(Some(&glib::markup_escape_text(&details.join(" · "))));
+        self.songs_details.set_text(&details.join(" · "));
 
-        // Songs that were deleted can't stay selected.
-        self.selected.borrow_mut().retain(|id| tracks.iter().any(|track| track.id == *id));
-
-        self.songs.remove_all();
-        let mut song_rows = Vec::new();
-        for track in &tracks {
-            let check = gtk::CheckButton::builder()
-                .valign(gtk::Align::Center)
-                .css_classes(["selection-mode"])
-                .build();
-            let (row, menu_button) = self.song_row(track, &playlists, None, Some(&check));
-            let id = track.id;
-            check.set_active(self.selected.borrow().contains(&id));
-            let this = self.this.clone();
-            check.connect_toggled(move |check| {
-                if let Some(this) = this.upgrade() {
-                    let mut selected = this.selected.borrow_mut();
-                    if check.is_active() {
-                        selected.insert(id);
-                    } else {
-                        selected.remove(&id);
-                    }
-                    drop(selected); // update_selection_bar borrows it again
-                    this.update_selection_bar();
-                }
-            });
-            self.songs.append(&row);
-            song_rows.push(SongRow { id, row, check, menu_button });
-        }
-        self.song_rows.replace(song_rows);
-        self.show_selection_mode(self.select_button.is_active());
+        // The song list keeps the songs it already has (and their ticks and
+        // covers), removes the ones that are gone and adds the new ones. Its
+        // own signals come a moment later, so update what depends on it now.
+        self.songs.set_tracks(&tracks);
+        self.update_songs_view();
+        self.update_selection_bar();
         self.selection_add_button.set_menu_model(Some(&selection_menu(&playlists)));
 
         self.playlists.remove_all();
@@ -489,7 +517,7 @@ impl Library {
                     open.list.remove_all();
                     for id in &playlist.track_ids {
                         if let Some(track) = tracks.iter().find(|track| track.id == *id) {
-                            open.list.append(&self.song_row(track, &playlists, Some(playlist.id), None).0);
+                            open.list.append(&self.song_row(track, &playlists, Some(playlist.id)));
                         }
                     }
                 }
@@ -503,18 +531,15 @@ impl Library {
         }
     }
 
-    /// A song in a list, with its cover and a menu. `in_playlist` is set on
-    /// a playlist page, to offer "Remove from Playlist". `check` is the
-    /// selection mode check box, shown in front of the cover.
-    ///
-    /// Returns a tuple: the row, and its menu button (hidden while selecting).
+    /// A song on a playlist page, with its cover and a menu. `in_playlist` is
+    /// set there, to offer "Remove from Playlist". (The main song list builds
+    /// its rows in `songs.rs`.)
     fn song_row(
         &self,
         track: &Track,
         playlists: &[gpod::Playlist],
         in_playlist: Option<PlaylistId>,
-        check: Option<&gtk::CheckButton>,
-    ) -> (adw::ActionRow, gtk::MenuButton) {
+    ) -> adw::ActionRow {
         let subtitle = [track.artist.as_deref(), track.album.as_deref()]
             .into_iter()
             .flatten()
@@ -526,9 +551,6 @@ impl Library {
             .use_markup(false)
             .build();
 
-        if let Some(check) = check {
-            row.add_prefix(check);
-        }
         let cover = match self.cover(track.id) {
             Some(texture) => gtk::Image::from_paintable(Some(&texture)),
             None => gtk::Image::from_icon_name("audio-x-generic-symbolic"),
@@ -550,7 +572,7 @@ impl Library {
             .tooltip_text("More")
             .build();
         row.add_suffix(&menu_button);
-        (row, menu_button)
+        row
     }
 
     /// Turns selection mode on or off (from the select button).
@@ -559,19 +581,14 @@ impl Library {
             self.select_button.set_active(false);
             return;
         }
-        self.select_all(false);
+        // Start (and end) with nothing ticked. The rows follow the select
+        // button by themselves: check boxes instead of ⋮ menus (see `songs.rs`).
+        self.songs.clear_selection();
         self.show_selection_mode(on);
     }
 
-    /// Shows or hides the check boxes and the selection bar.
+    /// Shows or hides the selection bar.
     fn show_selection_mode(&self, on: bool) {
-        for song in self.song_rows.borrow().iter() {
-            song.check.set_visible(on);
-            song.menu_button.set_visible(!on);
-            // While selecting, clicking anywhere on the row ticks its box.
-            song.row.set_activatable_widget(if on { Some(&song.check) } else { None });
-            song.row.set_activatable(on);
-        }
         self.add_button.set_sensitive(!on && !self.busy.get());
         if !self.busy.get() {
             self.bottom_bar.set_visible_child_name("selection");
@@ -581,49 +598,37 @@ impl Library {
     }
 
     fn update_selection_bar(&self) {
-        let count = self.selected.borrow().len();
-        let total = self.song_rows.borrow().len();
-        self.selection_label.set_text(&match count {
+        let stats = self.songs.stats();
+        self.selection_label.set_text(&match stats.selected {
             0 => "Select songs".to_string(),
-            _ => format!("{} selected", songs_count(count)),
+            count => format!("{} selected", songs_count(count)),
         });
-        self.selection_add_button.set_sensitive(count > 0);
-        self.selection_delete_button.set_sensitive(count > 0);
-        self.select_all_button
-            .set_label(if count == total && total > 0 { "Select None" } else { "Select All" });
+        self.selection_add_button.set_sensitive(stats.selected > 0);
+        self.selection_delete_button.set_sensitive(stats.selected > 0);
+        let all_ticked = stats.total > 0 && stats.selected == stats.total;
+        self.select_all_button.set_label(if all_ticked { "Select None" } else { "Select All" });
+        self.select_all_button.set_sensitive(stats.total > 0);
     }
 
+    /// Ticks every song, or unticks them when they're all ticked already.
     fn toggle_select_all(&self) {
-        let all = self.selected.borrow().len() == self.song_rows.borrow().len();
-        self.select_all(!all);
+        let stats = self.songs.stats();
+        let all_ticked = stats.total > 0 && stats.selected == stats.total;
+        self.songs.select_all(!all_ticked);
     }
 
-    /// Ticks (or unticks) every song. Each check box updates `selected`
-    /// itself when it's toggled.
-    fn select_all(&self, on: bool) {
-        // Clone the check boxes first: toggling them runs handlers that
-        // borrow song_rows, and a RefCell can't be borrowed mutably while a
-        // borrow is still alive.
-        let checks: Vec<gtk::CheckButton> =
-            self.song_rows.borrow().iter().map(|song| song.check.clone()).collect();
-        for check in checks {
-            check.set_active(on);
-        }
-        if !on {
-            self.selected.borrow_mut().clear();
-        }
-        self.update_selection_bar();
+    /// The "35 Songs · 2h 5m" line above the list, and whether the list or the
+    /// "No Songs Yet" page is showing.
+    fn update_songs_view(&self) {
+        let stats = self.songs.stats();
+        let songs = if stats.total == 1 { "1 Song".to_string() } else { format!("{} Songs", stats.total) };
+        self.songs_title.set_text(&format!("{songs} · {}", format_duration(stats.length)));
+        self.songs_stack.set_visible_child_name(if stats.total == 0 { "empty" } else { "list" });
     }
 
-    /// The selected songs, in the order the list shows them.
+    /// The ticked songs, in the order the list shows them.
     fn selected_ids(&self) -> Vec<TrackId> {
-        let selected = self.selected.borrow();
-        self.song_rows
-            .borrow()
-            .iter()
-            .map(|song| song.id)
-            .filter(|id| selected.contains(id))
-            .collect()
+        self.songs.selected_ids()
     }
 
     fn playlist_name(&self, id: PlaylistId) -> String {
@@ -1139,9 +1144,23 @@ fn boxed_list(placeholder: &str) -> gtk::ListBox {
     list
 }
 
-/// Songs sorted by title, ignoring case, like the iPod does.
-fn sort_key(track: &Track) -> String {
-    track.title.as_deref().unwrap_or_default().to_lowercase()
+/// For trying the song list with a big library. In a debug build,
+/// `OXIPOD_FAKE_SONGS=5000 cargo run` adds that many made-up songs to the
+/// list. They aren't in the database, so deleting one or adding it to a
+/// playlist just shows an error. Release builds ignore the variable.
+fn with_test_songs(mut tracks: Vec<Track>) -> Vec<Track> {
+    if !cfg!(debug_assertions) {
+        return tracks;
+    }
+    let count: u64 = std::env::var("OXIPOD_FAKE_SONGS").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
+    tracks.extend((0..count).map(|n| Track {
+        id: u64::MAX - n,
+        title: Some(format!("Fake Song {:05}", (n * 7919) % count.max(1))),
+        artist: Some(format!("Fake Artist {}", n % 97)),
+        album: Some(format!("Fake Album {}", n % 389)),
+        length: Duration::from_secs(120 + n % 240),
+    }));
+    tracks
 }
 
 fn files_count(count: usize) -> String {
