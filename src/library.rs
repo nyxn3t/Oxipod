@@ -14,7 +14,7 @@ use gtk::{gdk, gio, glib};
 use crate::convert;
 use crate::eject;
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
-use crate::songs::{SongList, SortMode};
+use crate::songs::{SongList, SortMode, show_cover};
 
 /// Shown at this size in the song list.
 pub const COVER_SIZE: i32 = 40;
@@ -646,11 +646,8 @@ impl Library {
             .use_markup(false)
             .build();
 
-        let cover = match self.cover(track.id) {
-            Some(texture) => gtk::Image::from_paintable(Some(&texture)),
-            None => gtk::Image::from_icon_name("audio-x-generic-symbolic"),
-        };
-        cover.set_pixel_size(COVER_SIZE);
+        let cover = gtk::Image::builder().pixel_size(COVER_SIZE).build();
+        show_cover(&cover, self.cover(track.id).as_ref());
         row.add_prefix(&cover);
 
         let length = gtk::Label::builder()

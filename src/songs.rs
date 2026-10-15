@@ -607,10 +607,19 @@ fn row_factory(
     factory
 }
 
-fn show_cover(image: &gtk::Image, cover: Option<&gdk::Texture>) {
+/// Shows a song's cover, or a plain music note when it has none. The note is
+/// dimmed (`dim-label` makes a widget half see-through): at full brightness it
+/// looks much heavier than the covers around it.
+pub fn show_cover(image: &gtk::Image, cover: Option<&gdk::Texture>) {
     match cover {
-        Some(texture) => image.set_paintable(Some(texture)),
-        None => image.set_icon_name(Some("audio-x-generic-symbolic")),
+        Some(texture) => {
+            image.set_paintable(Some(texture));
+            image.remove_css_class("dim-label");
+        }
+        None => {
+            image.set_icon_name(Some("audio-x-generic-symbolic"));
+            image.add_css_class("dim-label");
+        }
     }
 }
 
