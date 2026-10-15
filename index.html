@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Oxipod, the Flatpak repository</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  pre { background: rgba(127, 127, 127, 0.15); padding: 0.75rem 1rem; border-radius: 0.5rem; overflow-x: auto; }
+  code { font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<h1>Oxipod</h1>
+<p>Put music on your old iPod from Linux. This is Oxipod's own Flatpak repository: add it once, and new
+releases show up in your software center and with <code>flatpak update</code>.</p>
+
+<pre><code>flatpak remote-add --user --if-not-exists oxipod https://nyxn3t.github.io/Oxipod/oxipod.flatpakrepo
+flatpak install --user oxipod io.github.nyxn3t.Oxipod</code></pre>
+
+<p>Or open <a href="oxipod.flatpakref">oxipod.flatpakref</a> with your software center.</p>
+
+<p>This is not Flathub. Adding the repository means you trust me to ship updates; they are signed with this
+key: <code>899048DA42D4FA507EC6F01FA9A4E497D0B17C45</code>.</p>
+
+<p><a href="https://github.com/nyxn3t/Oxipod">Oxipod on GitHub</a>: the source, the releases with a plain
+<code>.flatpak</code> file, and the place to say how it works on your iPod.</p>
+</body>
+</html>
