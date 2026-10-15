@@ -80,6 +80,9 @@ fn build_ui(app: &adw::Application) {
     let header = adw::HeaderBar::new();
     let main_menu = gio::Menu::new();
     main_menu.append(Some("Offer a Backup When Opening an iPod"), Some("win.ask-backup"));
+    let about_section = gio::Menu::new();
+    about_section.append(Some("About Oxipod"), Some("win.about"));
+    main_menu.append_section(None, &about_section);
     header.pack_end(
         &gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -128,6 +131,12 @@ fn build_ui(app: &adw::Application) {
         }
     });
     window.add_action(&ask_backup);
+    let about = gio::SimpleAction::new("about", None);
+    {
+        let window = window.clone();
+        about.connect_activate(move |_, _| show_about(&window));
+    }
+    window.add_action(&about);
 
     let context = Context {
         window: window.clone(),
@@ -225,6 +234,57 @@ fn open_ipod(mount_path: &Path, context: &Context) -> Option<Rc<Library>> {
             None
         }
     }
+}
+
+/// The About window. Its "Report an Issue" button opens the project's issue
+/// page, and its troubleshooting section has what a bug report should say.
+fn show_about(window: &adw::ApplicationWindow) {
+    let about = adw::AboutDialog::builder()
+        .application_name("Oxipod")
+        .application_icon(APP_ID)
+        .developer_name("nyxn3t")
+        .version(env!("CARGO_PKG_VERSION"))
+        .comments("Put music on your old iPod")
+        .website("https://github.com/nyxn3t/Oxipod")
+        .issue_url("https://github.com/nyxn3t/Oxipod/issues")
+        .license_type(gtk::License::Gpl30)
+        .copyright("© 2026 nyxn3t")
+        .debug_info(debug_info())
+        .debug_info_filename("oxipod-troubleshooting.txt")
+        .build();
+    about.present(Some(window));
+}
+
+/// What a bug report should say about the app, the computer and the iPods
+/// that are plugged in. No names or paths: people paste this into issues.
+fn debug_info() -> String {
+    let setting = |name: &str| std::env::var(name).unwrap_or_else(|_| "unknown".into());
+    let mut lines = vec![
+        format!(
+            "Oxipod {}{}",
+            env!("CARGO_PKG_VERSION"),
+            // Inside a Flatpak sandbox this file always exists.
+            if Path::new("/.flatpak-info").exists() { " (Flatpak)" } else { "" }
+        ),
+        format!(
+            "GTK {}.{}.{}, libadwaita {}.{}.{}",
+            gtk::major_version(),
+            gtk::minor_version(),
+            gtk::micro_version(),
+            adw::major_version(),
+            adw::minor_version(),
+            adw::micro_version()
+        ),
+        format!("Desktop: {}, {}", setting("XDG_CURRENT_DESKTOP"), setting("XDG_SESSION_TYPE")),
+    ];
+    let ipods = device::find_ipods(&gio::VolumeMonitor::get());
+    if ipods.is_empty() {
+        lines.push("No iPod connected".into());
+    }
+    for (number, ipod) in ipods.iter().enumerate() {
+        lines.push(format!("iPod {}: {}", number + 1, device::describe(ipod)));
+    }
+    lines.join("\n")
 }
 
 /// A message with a Close button.

@@ -1109,5 +1109,13 @@ mod tests {
         window.close();
 
         check_the_filters(&button);
+
+        // The troubleshooting text of the About window needs GTK too.
+        let info = crate::debug_info();
+        assert!(info.starts_with(&format!("Oxipod {}", env!("CARGO_PKG_VERSION"))), "{info}");
+        assert!(info.contains("GTK 4.") && info.contains("libadwaita 1."), "{info}");
+        // Either no iPod is plugged in, or every one has a line.
+        assert!(info.contains("No iPod connected") || info.contains("iPod 1: "), "{info}");
+        println!("troubleshooting info:\n{info}");
     }
 }
