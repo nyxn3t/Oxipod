@@ -173,6 +173,12 @@ fn build_ui(app: &adw::Application) {
         let reload: Rc<dyn Fn()> = Rc::new(move || refresh(&gio::VolumeMonitor::get()));
         rename.connect_activate(move |_, target| {
             if let Some((mount_path, name)) = target.and_then(|target| target.get::<(String, String)>()) {
+                // Renaming writes to the iPod.
+                let access = device::access(Path::new(&mount_path));
+                if access.read_only {
+                    library::read_only_dialog(access.filesystem.as_deref()).present(Some(&window));
+                    return;
+                }
                 ask_new_name(&window, &list, PathBuf::from(mount_path), name, reload.clone());
             }
         });
@@ -322,6 +328,10 @@ enum Prepared {
 
 /// Does the first-time setup of an iPod, if it needs one and the person agrees.
 async fn prepare_ipod(context: &Context, mount_path: &Path) -> Prepared {
+    // The setup saves a file on the iPod, which a read-only iPod doesn't allow.
+    if device::access(mount_path).read_only {
+        return Prepared::Nothing;
+    }
     if !sysinfo::needs_setup(mount_path).await {
         return Prepared::Nothing;
     }
@@ -459,11 +469,14 @@ fn show_ipods(monitor: &gio::VolumeMonitor, list: &gtk::ListBox, stack: &gtk::St
     for ipod in &ipods {
         // The mount path has the user's name in it (/run/media/<user>/…), so
         // it's only in the tooltip: screenshots of the row stay anonymous.
-        let subtitle = format!(
+        let mut subtitle = format!(
             "{} free of {}",
             glib::format_size(ipod.free_bytes),
             glib::format_size(ipod.total_bytes)
         );
+        if ipod.read_only {
+            subtitle.push_str(" · read-only");
+        }
         let row = adw::ActionRow::builder()
             .title(&ipod.name)
             .subtitle(subtitle)
@@ -494,6 +507,11 @@ fn show_ipods(monitor: &gio::VolumeMonitor, list: &gtk::ListBox, stack: &gtk::St
             .css_classes(["flat"])
             .tooltip_text("Settings")
             .build();
+        if ipod.read_only {
+            let lock = gtk::Image::from_icon_name("changes-prevent-symbolic");
+            lock.set_tooltip_text(Some("Read-only: Oxipod can look at this iPod but not change it"));
+            row.add_suffix(&lock);
+        }
         row.add_suffix(&menu_button);
         row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
 

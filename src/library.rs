@@ -68,6 +68,13 @@ pub struct Library {
     cancel_button: gtk::Button,
     /// Offers to delete files the database doesn't know about.
     leftovers_banner: adw::Banner,
+    /// Says the iPod can't be changed, when that is so.
+    read_only_banner: adw::Banner,
+    /// True when the iPod is mounted read-only: it can be looked at and copied
+    /// from, but nothing on it can be changed.
+    read_only: bool,
+    /// The kind of file system the iPod has, for explaining why it is read-only.
+    filesystem: Option<String>,
     /// "35 Songs · 2h 5m" and the iPod's details, above the song list.
     songs_title: gtk::Label,
     songs_details: gtk::Label,
@@ -317,9 +324,15 @@ impl Library {
         toasts.set_child(Some(&tabs));
 
         let leftovers_banner = adw::Banner::builder().button_label("Clean Up…").build();
+        let read_only_banner = adw::Banner::builder()
+            .title("This iPod is read-only, so Oxipod can look at it but not change it")
+            .button_label("Why?")
+            .build();
+        let access = device::access(mount_path);
 
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
+        toolbar.add_top_bar(&read_only_banner);
         toolbar.add_top_bar(&leftovers_banner);
         toolbar.set_content(Some(&toasts));
         toolbar.add_bottom_bar(&bottom_bar);
@@ -376,6 +389,9 @@ impl Library {
                 selection_more_button,
                 cancel_button,
                 leftovers_banner,
+                read_only_banner,
+                read_only: access.read_only,
+                filesystem: access.filesystem,
                 songs_title,
                 songs_details,
                 songs_stack,
@@ -393,6 +409,9 @@ impl Library {
 
         library.connect_signals(&new_playlist_button, &tabs);
         library.add_actions();
+        if library.read_only {
+            library.make_read_only(&new_playlist_button);
+        }
         library.refresh();
         library.check_leftovers();
         Ok(library)
@@ -404,6 +423,46 @@ impl Library {
 
     pub fn mount_path(&self) -> &Path {
         &self.mount_path
+    }
+
+    /// The iPod can't be changed: switches off everything that would write to
+    /// it, and says why. Looking at it, copying songs off it and backing it up
+    /// still work.
+    fn make_read_only(self: &Rc<Self>, new_playlist_button: &gtk::Button) {
+        const TIP: &str = "This iPod is read-only";
+        self.add_button.set_sensitive(false);
+        self.add_button.set_tooltip_text(Some(TIP));
+        new_playlist_button.set_sensitive(false);
+        new_playlist_button.set_tooltip_text(Some(TIP));
+
+        // A menu item whose action is switched off is greyed out.
+        for name in [
+            "delete-song",
+            "choose-cover",
+            "choose-album-cover",
+            "remove-cover",
+            "choose-cover-selected",
+            "remove-cover-selected",
+            "select-extra-copies",
+            "new-playlist-with-song",
+            "add-selected-to-playlist",
+            "new-playlist-with-selected",
+            "add-to-playlist",
+            "remove-from-playlist",
+            "delete-playlist",
+        ] {
+            if let Some(action) = self.actions.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+                action.set_enabled(false);
+            }
+        }
+
+        self.read_only_banner.set_revealed(true);
+        let this = Rc::downgrade(self);
+        self.read_only_banner.connect_button_clicked(move |_| {
+            if let Some(this) = this.upgrade() {
+                read_only_dialog(this.filesystem.as_deref()).present(Some(&this.page));
+            }
+        });
     }
 
     /// Signal handlers hold a `Weak` reference: one that doesn't keep the
@@ -805,7 +864,7 @@ impl Library {
 
     /// Shows or hides the selection bar.
     fn show_selection_mode(&self, on: bool) {
-        self.add_button.set_sensitive(!on && !self.busy.get());
+        self.add_button.set_sensitive(!on && !self.busy.get() && !self.read_only);
         if !self.busy.get() {
             self.bottom_bar.set_visible_child_name("selection");
             self.toolbar.set_reveal_bottom_bars(on);
@@ -823,10 +882,12 @@ impl Library {
             (count, 0) => format!("{} selected", songs_count(count)),
             (count, hidden) => format!("{} selected, {hidden} hidden by the search or filter", songs_count(count)),
         });
-        self.selection_add_button.set_sensitive(stats.selected > 0);
-        self.selection_delete_button.set_sensitive(stats.selected > 0);
+        // Copying only reads from the iPod; everything else changes it.
+        let can_change = stats.selected > 0 && !self.read_only;
+        self.selection_add_button.set_sensitive(can_change);
+        self.selection_delete_button.set_sensitive(can_change);
         self.selection_copy_button.set_sensitive(stats.selected > 0);
-        self.selection_more_button.set_sensitive(stats.selected > 0);
+        self.selection_more_button.set_sensitive(can_change);
         let all_ticked = stats.shown > 0 && stats.shown_selected == stats.shown;
         self.select_all_button.set_label(if all_ticked { "Select None" } else { "Select All" });
         self.select_all_button.set_sensitive(stats.shown > 0);
@@ -949,6 +1010,10 @@ impl Library {
     /// Runs `edit` on the database, saves it to the iPod and refreshes the
     /// page. Errors are shown as a toast. Returns whether it worked.
     fn change(&self, edit: impl FnOnce(&mut Database) -> Result<(), gpod::Error>) -> bool {
+        if self.read_only {
+            self.toast("This iPod is read-only, so it can't be changed");
+            return false;
+        }
         if self.busy.get() {
             self.toast("Wait until the current job is done");
             return false;
@@ -1006,6 +1071,10 @@ impl Library {
     /// gives GTK a chance to redraw and handle clicks while ffmpeg converts
     /// or a file is copied on a background thread.
     async fn import(self: Rc<Self>, paths: Vec<PathBuf>) {
+        if self.read_only {
+            self.toast("This iPod is read-only, so songs can't be added");
+            return;
+        }
         let files = convert::music_files(paths);
         if files.is_empty() {
             self.toast("No music files found");
@@ -1139,7 +1208,7 @@ impl Library {
     fn end_job(&self) {
         self.busy.set(false);
         self.select_button.set_sensitive(true);
-        self.add_button.set_sensitive(true);
+        self.add_button.set_sensitive(!self.read_only);
         self.eject_button.set_sensitive(true);
         self.toolbar.set_reveal_bottom_bars(false);
     }
@@ -1484,6 +1553,10 @@ impl Library {
 
     /// Shows the banner if the iPod has song files the database doesn't know.
     fn check_leftovers(&self) {
+        // Cleaning up would delete files, which a read-only iPod doesn't allow.
+        if self.read_only {
+            return;
+        }
         let leftovers = self.db.borrow().orphaned_files();
         if leftovers.is_empty() {
             self.leftovers_banner.set_revealed(false);
@@ -1849,6 +1922,13 @@ fn with_test_songs(mut tracks: Vec<Track>) -> Vec<Track> {
 
 fn files_count(count: usize) -> String {
     if count == 1 { "1 file".into() } else { format!("{count} files") }
+}
+
+/// The window that says why an iPod is read-only and what can be done about it.
+pub fn read_only_dialog(filesystem: Option<&str>) -> adw::AlertDialog {
+    let dialog = adw::AlertDialog::new(Some("This iPod Is Read-Only"), Some(&device::read_only_explanation(filesystem)));
+    dialog.add_response("close", "Close");
+    dialog
 }
 
 fn songs_count(count: usize) -> String {

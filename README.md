@@ -89,6 +89,20 @@ small file to the iPod.
 
 </details>
 
+### iPods formatted on a Mac
+
+iPods that were formatted on a Mac (HFS+) are mounted read-only on Linux for as
+long as their journal is turned on, which is how a Mac sets them up. Oxipod
+notices: a lock shows next to the iPod in the list, a message at the top of its
+page says why, and everything that would change the iPod is switched off.
+Looking at the songs, copying them off the iPod and backing it up still work.
+
+To be able to add songs, turn the journal off on a Mac (in Terminal:
+`diskutil disableJournal /Volumes/NAME_OF_THE_IPOD`), or reformat the iPod as
+FAT32, which erases everything on it. An iPod that was unplugged without being
+ejected can be read-only too: plug it in again, and let a computer check the
+disk if it stays that way.
+
 ## Building
 
 You need Rust, GTK 4, libadwaita, libgpod, clang (for the libgpod bindings)

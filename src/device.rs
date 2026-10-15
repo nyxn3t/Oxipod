@@ -69,6 +69,53 @@ pub fn find_ipods(monitor: &gio::VolumeMonitor) -> Vec<Ipod> {
         .collect()
 }
 
+/// How an iPod's drive is mounted.
+pub struct Access {
+    /// The kind of file system, like "msdos" or "hfsplus", if it can be read.
+    pub filesystem: Option<String>,
+    /// Whether Oxipod can look at the iPod but not change it.
+    pub read_only: bool,
+}
+
+/// How the drive that `path` is on is mounted. If that can't be found out,
+/// the iPod counts as one that can be changed (it will say so when it can't).
+pub fn access(path: &Path) -> Access {
+    match disk_space(&gio::File::for_path(path)) {
+        Ok(space) => Access { filesystem: space.filesystem, read_only: space.read_only },
+        Err(_) => Access { filesystem: None, read_only: false },
+    }
+}
+
+/// What to tell the person about an iPod that is mounted read-only: why it
+/// probably is, and what can be done about it.
+pub fn read_only_explanation(filesystem: Option<&str>) -> String {
+    let looks = "so Oxipod can look at it and copy songs off it, but not change it";
+    match filesystem {
+        Some("hfsplus") => format!(
+            "This iPod is formatted for a Mac (HFS+). Linux mounts those read-only as long as \
+             their journal is turned on, which is how a Mac sets them up, {looks}.\n\n\
+             To change that, turn the journal off on a Mac (in Terminal: diskutil disableJournal \
+             /Volumes/NAME_OF_THE_IPOD), or reformat the iPod as FAT32, which erases everything \
+             on it. If it is still read-only after that, the disk may need a repair."
+        ),
+        Some("msdos" | "vfat") => format!(
+            "This iPod is mounted read-only, {looks}.\n\n\
+             With a FAT iPod that usually means it was unplugged without being ejected, and the \
+             computer wants the disk checked before it allows changes. Plug it in again, and if \
+             it stays read-only, let a computer check the disk (fsck on Linux, Check Disk on \
+             Windows). Eject it from Oxipod next time."
+        ),
+        Some(other) => format!(
+            "This iPod is mounted read-only (its file system is {other}), {looks}.\n\n\
+             If you didn't expect that, unplug the iPod and plug it in again."
+        ),
+        None => format!(
+            "This iPod is mounted read-only, {looks}.\n\n\
+             If you didn't expect that, unplug the iPod and plug it in again."
+        ),
+    }
+}
+
 /// Free space on the drive that `path` is on, in bytes, if it can be read.
 pub fn free_space(path: &Path) -> Option<u64> {
     disk_space(&gio::File::for_path(path)).ok().map(|space| space.free)
@@ -151,6 +198,49 @@ mod tests {
         assert!(text.starts_with("Nano Video (3rd Gen.), model B261, hfsplus, read-only, "), "{text}");
         assert!(text.contains("free of"), "{text}");
         assert!(!text.contains("Dylan") && !text.contains("/run/media"), "{text}");
+    }
+
+    #[test]
+    fn explains_a_read_only_mac_ipod_with_the_way_out() {
+        let text = read_only_explanation(Some("hfsplus"));
+        assert!(text.contains("Mac") && text.contains("diskutil disableJournal"), "{text}");
+        assert!(text.contains("look at it and copy songs off it"), "{text}");
+    }
+
+    #[test]
+    fn explains_a_read_only_fat_ipod_differently() {
+        for filesystem in ["msdos", "vfat"] {
+            let text = read_only_explanation(Some(filesystem));
+            assert!(text.contains("ejected") && text.contains("fsck"), "{text}");
+            assert!(!text.contains("diskutil"), "{text}");
+        }
+    }
+
+    #[test]
+    fn explains_a_read_only_ipod_whatever_the_file_system() {
+        assert!(read_only_explanation(Some("ntfs")).contains("file system is ntfs"));
+        let unknown = read_only_explanation(None);
+        assert!(unknown.contains("read-only") && !unknown.contains("file system is"), "{unknown}");
+    }
+
+    #[test]
+    fn a_folder_that_is_not_an_ipod_still_has_an_answer() {
+        // Wherever this runs, asking about a folder that exists works and
+        // asking about one that doesn't does not make a mess.
+        let folder = tempfile::tempdir().unwrap();
+        let _ = access(folder.path());
+        assert!(!access(Path::new("/this/does/not/exist")).read_only);
+    }
+
+    // Says how a mounted iPod is mounted. Only looks. Run with:
+    // OXIPOD_TEST_IPOD=/run/media/... cargo test how_a_mounted_ipod_is_mounted -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a mounted iPod, set OXIPOD_TEST_IPOD to its mount point"]
+    fn how_a_mounted_ipod_is_mounted() {
+        let mount = std::env::var("OXIPOD_TEST_IPOD").expect("OXIPOD_TEST_IPOD is not set");
+        let access = access(Path::new(&mount));
+        println!("file system: {:?}, read-only: {}", access.filesystem, access.read_only);
+        println!("{}", read_only_explanation(access.filesystem.as_deref()));
     }
 
     #[test]
