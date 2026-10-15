@@ -39,16 +39,37 @@ music on the window, and that's it.
 
 ## Installing
 
-Grab the `.flatpak` file from the [latest release](https://github.com/nyxn3t/Oxipod/releases/latest)
-and install it:
+Add Oxipod's own Flatpak repository once and install from it. After that,
+updates show up in your software center and with `flatpak update`:
+
+```
+flatpak remote-add --user --if-not-exists oxipod https://nyxn3t.github.io/Oxipod/oxipod.flatpakrepo
+flatpak install --user oxipod io.github.nyxn3t.Oxipod
+```
+
+Or open [oxipod.flatpakref](https://nyxn3t.github.io/Oxipod/oxipod.flatpakref)
+with your software center. It pulls in the GNOME runtime from Flathub if you
+don't have it yet.
+
+This isn't Flathub, so adding the repository means you trust me to ship updates.
+They're signed with this key, which Flatpak checks for you:
+`8990 48DA 42D4 FA50 7EC6 F01F A9A4 E497 D0B1 7C45`.
+
+If you'd rather not add a repository, grab the `.flatpak` file from the
+[latest release](https://github.com/nyxn3t/Oxipod/releases/latest) and install
+it:
 
 ```
 flatpak install --user oxipod-*.flatpak
 ```
 
-It pulls in the GNOME runtime from Flathub if you don't have it yet. Oxipod
-isn't on Flathub itself (yet), so updates won't show up automatically: check
-the releases page now and then.
+That one doesn't update by itself: check the releases page now and then. If you
+installed it that way and want updates, remove it first and use the repository
+(your settings stay):
+
+```
+flatpak uninstall --user io.github.nyxn3t.Oxipod
+```
 
 ## Which iPods work
 
