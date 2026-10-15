@@ -13,8 +13,9 @@ use gtk::{gdk, gio, glib};
 
 use crate::convert;
 use crate::eject;
-use crate::export::{self, Outcome};
+use crate::export::{self, Layout, Outcome};
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
+use crate::settings::Settings;
 use crate::songs::{SongList, SortMode, show_cover};
 
 /// Shown at this size in the song list.
@@ -78,6 +79,8 @@ pub struct Library {
     busy: Cell<bool>,
     /// Set by the Cancel button; the copy job looks at it after every song.
     cancel: Cell<bool>,
+    /// What the app remembers between runs (how copied songs are arranged).
+    settings: Settings,
 }
 
 /// Why adding a song didn't work.
@@ -88,11 +91,11 @@ enum ImportError {
     Stop(String),
 }
 
-/// One song to copy to the computer: where its file is on the iPod, and what
-/// to call it there.
+/// One song to copy to the computer: where its file is on the iPod, and where
+/// it goes in the folder the user picked (a name, or folders and a name).
 struct ExportJob {
     source: PathBuf,
-    name: String,
+    relative: PathBuf,
 }
 
 struct OpenPlaylist {
@@ -335,6 +338,7 @@ impl Library {
                 covers: RefCell::new(HashMap::new()),
                 busy: Cell::new(false),
                 cancel: Cell::new(false),
+                settings: Settings::load(),
             }
         });
 
@@ -1011,7 +1015,18 @@ impl Library {
         self.toolbar.set_reveal_bottom_bars(false);
     }
 
-    /// Asks where to put the songs, then copies them there.
+    /// Copies every song on the iPod, whatever the search shows. This is the
+    /// "back up everything" button of the device list.
+    pub fn copy_all(self: &Rc<Self>) {
+        let ids = self.songs.all_ids();
+        if ids.is_empty() {
+            self.toast("There are no songs to copy");
+            return;
+        }
+        self.choose_export_folder(ids);
+    }
+
+    /// Asks how to arrange the songs, then where to put them, then copies them.
     fn choose_export_folder(self: &Rc<Self>, ids: Vec<TrackId>) {
         if ids.is_empty() {
             return;
@@ -1020,6 +1035,57 @@ impl Library {
             self.toast("Wait until the current job is done");
             return;
         }
+
+        // Two choices, each a row with a round check box. `set_group` ties the
+        // boxes together, so checking one unchecks the other.
+        let flat_check = gtk::CheckButton::new();
+        let folders_check = gtk::CheckButton::new();
+        folders_check.set_group(Some(&flat_check));
+        let choices = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        for (check, title, example) in [
+            (&flat_check, "All in one folder", "Artist - Title.mp3"),
+            (&folders_check, "In folders by artist and album", "Artist/Album/01 Title.mp3"),
+        ] {
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .subtitle(example)
+                .use_markup(false)
+                .activatable_widget(check)
+                .build();
+            row.add_prefix(check);
+            choices.append(&row);
+        }
+        match self.settings.copy_layout() {
+            Layout::Flat => flat_check.set_active(true),
+            Layout::Folders => folders_check.set_active(true),
+        }
+
+        let heading = match ids.len() {
+            1 => "Copy to Computer".to_string(),
+            count => format!("Copy {} to Computer", songs_count(count)),
+        };
+        let dialog = adw::AlertDialog::new(Some(&heading), Some("How should the songs be arranged?"));
+        dialog.set_extra_child(Some(&choices));
+        dialog.add_responses(&[("cancel", "Cancel"), ("choose", "Choose Folder…")]);
+        dialog.set_response_appearance("choose", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("choose"));
+        dialog.set_close_response("cancel");
+
+        let this = self.clone();
+        dialog.connect_response(Some("choose"), move |_, _| {
+            let layout = if folders_check.is_active() { Layout::Folders } else { Layout::Flat };
+            // Remembered for next time.
+            this.settings.set_copy_layout(layout);
+            this.choose_folder_and_export(ids.clone(), layout);
+        });
+        dialog.present(Some(&self.page));
+    }
+
+    /// The second step: the folder chooser, then the copying.
+    fn choose_folder_and_export(self: &Rc<Self>, ids: Vec<TrackId>, layout: Layout) {
         let dialog = gtk::FileDialog::builder().title("Copy to Computer").accept_label("Copy").build();
         // Start in the Music folder, if there is one.
         if let Some(music) = glib::user_special_dir(glib::UserDirectory::Music) {
@@ -1037,7 +1103,7 @@ impl Library {
                 this.toast("That folder can't be used");
                 return;
             };
-            this.export(ids, path).await;
+            this.export(ids, path, layout).await;
         });
     }
 
@@ -1045,7 +1111,7 @@ impl Library {
     /// up front, on the main thread where the database is, so the copying
     /// thread only needs plain paths. Songs the database doesn't have a file
     /// for are left out.
-    fn export_jobs(&self, ids: &[TrackId]) -> Vec<ExportJob> {
+    fn export_jobs(&self, ids: &[TrackId], layout: Layout) -> Vec<ExportJob> {
         let db = self.db.borrow();
         let tracks: HashMap<TrackId, Track> = db.tracks().into_iter().map(|track| (track.id, track)).collect();
         ids.iter()
@@ -1054,8 +1120,8 @@ impl Library {
                 let track = tracks.get(id)?;
                 let source = db.track_file(*id)?;
                 let extension = source.extension().and_then(|e| e.to_str()).unwrap_or("mp3").to_lowercase();
-                let name = export::file_name(track.artist.as_deref(), track.title.as_deref(), &extension);
-                Some(ExportJob { source, name })
+                let relative = export::relative_path(layout, track, &extension);
+                Some(ExportJob { source, relative })
             })
             .collect()
     }
@@ -1064,8 +1130,8 @@ impl Library {
     /// readable names. Like `import`, this is an `async fn`: every `.await`
     /// lets GTK redraw and handle clicks (the Cancel button, say) while a file
     /// is copied on a background thread.
-    async fn export(self: Rc<Self>, ids: Vec<TrackId>, folder: PathBuf) {
-        let jobs = self.export_jobs(&ids);
+    async fn export(self: Rc<Self>, ids: Vec<TrackId>, folder: PathBuf, layout: Layout) {
+        let jobs = self.export_jobs(&ids, layout);
         if jobs.is_empty() {
             self.toast("Nothing to copy");
             return;
@@ -1091,7 +1157,8 @@ impl Library {
         self.begin_job(true);
 
         let mut report = export::Report::default();
-        // One of the copied files, so "Show Files" has something to point at.
+        // The first thing that was copied (a file, or the first artist folder),
+        // so "Show Files" has something to point at.
         let mut a_file = None;
         for (i, job) in jobs.iter().enumerate() {
             if self.cancel.get() {
@@ -1102,26 +1169,30 @@ impl Library {
                 report.stopped = Some("The iPod was disconnected.".into());
                 break;
             }
-            self.progress_label.set_text(&format!("Copying {} of {}: {}", i + 1, jobs.len(), job.name));
+            let name = job.relative.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            self.progress_label.set_text(&format!("Copying {} of {}: {name}", i + 1, jobs.len()));
+            // What "Show Files" will point at: the first part of the path
+            // inside the chosen folder.
+            let top = job.relative.components().next().map(|part| folder.join(part.as_os_str()));
 
             // Everything the thread uses is moved into it, like in import_file.
-            let (source, target_folder, name) = (job.source.clone(), folder.clone(), job.name.clone());
-            match gio::spawn_blocking(move || export::copy_song(&source, &target_folder, &name)).await {
-                Ok(Ok(Outcome::Copied(path))) => {
+            let (source, target_folder, relative) = (job.source.clone(), folder.clone(), job.relative.clone());
+            match gio::spawn_blocking(move || export::copy_song(&source, &target_folder, &relative)).await {
+                Ok(Ok(Outcome::Copied)) => {
                     report.copied += 1;
-                    a_file.get_or_insert(path);
+                    a_file = a_file.or(top);
                 }
-                Ok(Ok(Outcome::AlreadyThere(path))) => {
+                Ok(Ok(Outcome::AlreadyThere)) => {
                     report.already_there += 1;
-                    a_file.get_or_insert(path);
+                    a_file = a_file.or(top);
                 }
                 // A full disk won't get better with the next song.
                 Ok(Err(error)) if error.kind() == std::io::ErrorKind::StorageFull => {
                     report.stopped = Some("The disk is full.".into());
                     break;
                 }
-                Ok(Err(error)) => report.failed.push(format!("{}: {error}", job.name)),
-                Err(_) => report.failed.push(format!("{}: the copy crashed", job.name)),
+                Ok(Err(error)) => report.failed.push(format!("{name}: {error}")),
+                Err(_) => report.failed.push(format!("{name}: the copy crashed")),
             }
             self.progress.set_fraction((i + 1) as f64 / jobs.len() as f64);
         }
@@ -1497,6 +1568,7 @@ fn with_test_songs(mut tracks: Vec<Track>) -> Vec<Track> {
         track_number: (n % 12) as i32 + 1,
         disc_number: 1,
         added: 1_700_000_000 + n * 60,
+        ..Default::default()
     }));
     tracks
 }

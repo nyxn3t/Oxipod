@@ -431,6 +431,12 @@ impl SongList {
         songs_in(&self.sorted).filter(|song| song.selected()).map(|song| song.id()).collect()
     }
 
+    /// Every song's id, in the order the list shows them, whatever the search
+    /// hides.
+    pub fn all_ids(&self) -> Vec<TrackId> {
+        songs_in(&self.sorted).map(|song| song.id()).collect()
+    }
+
     /// Ticks or unticks the songs that are shown. Hidden ones stay as they are.
     pub fn select_shown(&self, on: bool) {
         for song in songs_in(&self.filtered) {
@@ -650,6 +656,7 @@ mod tests {
             track_number: track,
             disc_number: disc,
             added,
+            ..Default::default()
         })
     }
 
@@ -750,6 +757,7 @@ mod tests {
                 track_number: (n % 12) as i32 + 1,
                 disc_number: 1,
                 added: n,
+                ..Default::default()
             })
             .collect();
 

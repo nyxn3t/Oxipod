@@ -47,7 +47,7 @@ impl std::error::Error for Error {}
 ///
 /// The fields are copied out of libgpod's memory, so a `Track` stays valid
 /// after the `Database` it came from is closed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Track {
     pub id: TrackId,
     pub title: Option<String>,
@@ -59,6 +59,16 @@ pub struct Track {
     pub disc_number: i32,
     /// When the song was put on the iPod, in seconds since 1970 (0 if unknown).
     pub added: u64,
+    /// The artist of the whole album, if it differs from the song's artist
+    /// (compilations: "Various Artists").
+    pub album_artist: Option<String>,
+    /// How many discs the album has (0 when unknown).
+    pub disc_count: i32,
+    /// The size of the song's file in bytes, and its bit rate in kbit/s.
+    pub size: u32,
+    pub bitrate: i32,
+    /// Whether the iPod has cover art for the song.
+    pub has_cover: bool,
 }
 
 /// A normal playlist made by the user (not the master playlist, the podcast
@@ -216,7 +226,7 @@ impl Database {
         self.track_ptrs()
             .into_iter()
             // SAFETY: the pointers come from the database's own track list.
-            .map(|track| unsafe { track_from_raw(&*track) })
+            .map(|track| unsafe { track_from_raw(track) })
             .collect()
     }
 
@@ -585,9 +595,10 @@ fn random_id(taken: impl Fn(u64) -> bool) -> u64 {
 ///
 /// # Safety
 /// The track's string fields must be NULL or valid C strings.
-unsafe fn track_from_raw(track: &ffi::Itdb_Track) -> Track {
+unsafe fn track_from_raw(track_ptr: *mut ffi::Itdb_Track) -> Track {
     // SAFETY: guaranteed by the caller.
     unsafe {
+        let track = &*track_ptr;
         Track {
             id: track.dbid,
             title: string_from_c(track.title),
@@ -597,6 +608,11 @@ unsafe fn track_from_raw(track: &ffi::Itdb_Track) -> Track {
             track_number: track.track_nr,
             disc_number: track.cd_nr,
             added: track.time_added.max(0) as u64,
+            album_artist: string_from_c(track.albumartist),
+            disc_count: track.cds,
+            size: track.size,
+            bitrate: track.bitrate,
+            has_cover: ffi::itdb_track_has_thumbnails(track_ptr) != 0,
         }
     }
 }
@@ -712,6 +728,30 @@ mod tests {
         let with_cover = tracks.iter().filter(|track| db.cover(track.id, 64).is_some()).count();
         println!("{with_cover} tracks have cover art");
         assert!(!tracks.is_empty());
+    }
+
+    // Checks that the new facts in `Track` agree with libgpod's own answers.
+    // Run with OXIPOD_TEST_IPOD set. Only reads from the iPod.
+    #[test]
+    #[ignore = "needs a mounted iPod, set OXIPOD_TEST_IPOD to its mount point"]
+    fn track_facts_match_what_libgpod_says() {
+        let mount = std::env::var("OXIPOD_TEST_IPOD").expect("OXIPOD_TEST_IPOD is not set");
+        let db = Database::open(Path::new(&mount)).expect("could not open the database");
+        let tracks = db.tracks();
+        for track in &tracks {
+            assert_eq!(track.has_cover, db.cover(track.id, 40).is_some(), "{:?}", track.title);
+            let file = db.track_file(track.id).expect("the song has a file");
+            assert_eq!(u64::from(track.size), std::fs::metadata(&file).unwrap().len(), "{:?}", track.title);
+        }
+        let with_cover = tracks.iter().filter(|track| track.has_cover).count();
+        let with_album_artist = tracks.iter().filter(|track| track.album_artist.is_some()).count();
+        let multi_disc = tracks.iter().filter(|track| track.disc_count > 1).count();
+        let bitrates: std::collections::BTreeSet<i32> = tracks.iter().map(|track| track.bitrate).collect();
+        println!(
+            "{} songs: {with_cover} with a cover, {} without; {with_album_artist} with an album artist; {multi_disc} on multi-disc albums; bit rates {bitrates:?}",
+            tracks.len(),
+            tracks.len() - with_cover
+        );
     }
 
     // Renames the iPod, checks the new name after reopening the database, and

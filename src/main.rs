@@ -4,10 +4,11 @@ mod eject;
 mod export;
 mod gpod;
 mod library;
+mod settings;
 mod songs;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -90,6 +91,8 @@ fn build_ui(app: &adw::Application) {
     // The volume monitor tells us when drives are mounted or unmounted.
     let monitor = gio::VolumeMonitor::get();
     let list = device_list.clone();
+    // The "Copy All" action opens an iPod's page too, so it needs these.
+    let (nav, open) = (navigation.clone(), open_library.clone());
     let refresh = move |monitor: &gio::VolumeMonitor| {
         show_ipods(monitor, &device_list, &stack, &navigation, &open_library);
     };
@@ -115,6 +118,21 @@ fn build_ui(app: &adw::Application) {
     }
     actions.add_action(&rename);
 
+    // "Copy All to Computer…": opens the iPod's page and starts copying
+    // everything on it. The target is the iPod's mount path.
+    let copy_all = gio::SimpleAction::new("copy-all", Some(glib::VariantTy::STRING));
+    {
+        let window = window.clone();
+        copy_all.connect_activate(move |_, target| {
+            if let Some(mount_path) = target.and_then(|target| target.str())
+                && let Some(library) = open_ipod(Path::new(mount_path), &nav, &open, &window)
+            {
+                library.copy_all();
+            }
+        });
+    }
+    actions.add_action(&copy_all);
+
     // `refresh` is moved into the first handler, so the others get clones.
     // A closure can be cloned when everything it captures can be cloned,
     // and GTK widgets are reference-counted, so cloning one is cheap.
@@ -131,6 +149,31 @@ fn build_ui(app: &adw::Application) {
     });
 
     window.present();
+}
+
+/// Opens the page of the iPod mounted at `mount_path`, or explains why that
+/// isn't possible. `parent` is the widget an error dialog belongs to.
+///
+/// `impl IsA<gtk::Widget>` means "any kind of widget": a row, a window...
+fn open_ipod(
+    mount_path: &Path,
+    navigation: &adw::NavigationView,
+    open_library: &OpenLibrary,
+    parent: &impl IsA<gtk::Widget>,
+) -> Option<Rc<Library>> {
+    match Library::new(mount_path, navigation) {
+        Ok(library) => {
+            navigation.push(library.page());
+            open_library.replace(Some(library.clone()));
+            Some(library)
+        }
+        Err(error) => {
+            let dialog = adw::AlertDialog::new(Some("Can't Read the Music Database"), Some(&error.to_string()));
+            dialog.add_response("close", "Close");
+            dialog.present(Some(parent));
+            None
+        }
+    }
 }
 
 /// Rebuilds the device list and switches between the list and the empty page.
@@ -175,6 +218,10 @@ fn show_ipods(
         // Settings for this iPod. Clicking the button doesn't open the iPod:
         // a MenuButton keeps its clicks to itself.
         let menu = gio::Menu::new();
+        let copy_all = gio::MenuItem::new(Some("Copy All to Computer…"), None);
+        let path_target = ipod.mount_path.to_string_lossy().to_variant();
+        copy_all.set_action_and_target_value(Some("device.copy-all"), Some(&path_target));
+        menu.append_item(&copy_all);
         let rename = gio::MenuItem::new(Some("Rename…"), None);
         let target = (ipod.mount_path.to_string_lossy().into_owned(), ipod.name.clone()).to_variant();
         rename.set_action_and_target_value(Some("device.rename"), Some(&target));
@@ -193,19 +240,8 @@ fn show_ipods(
         let mount_path = ipod.mount_path.clone();
         let navigation = navigation.clone();
         let open_library = open_library.clone();
-        row.connect_activated(move |row| match Library::new(&mount_path, &navigation) {
-            Ok(library) => {
-                navigation.push(library.page());
-                open_library.replace(Some(library));
-            }
-            Err(error) => {
-                let dialog = adw::AlertDialog::new(
-                    Some("Can't Read the Music Database"),
-                    Some(&error.to_string()),
-                );
-                dialog.add_response("close", "Close");
-                dialog.present(Some(row));
-            }
+        row.connect_activated(move |row| {
+            open_ipod(&mount_path, &navigation, &open_library, row);
         });
         list.append(&row);
     }
