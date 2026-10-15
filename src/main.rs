@@ -133,15 +133,17 @@ fn show_ipods(
 
     list.remove_all();
     for ipod in &ipods {
+        // The mount path has the user's name in it (/run/media/<user>/…), so
+        // it's only in the tooltip: screenshots of the row stay anonymous.
         let subtitle = format!(
-            "{} free of {} · {}",
+            "{} free of {}",
             glib::format_size(ipod.free_bytes),
-            glib::format_size(ipod.total_bytes),
-            ipod.mount_path.display()
+            glib::format_size(ipod.total_bytes)
         );
         let row = adw::ActionRow::builder()
             .title(&ipod.name)
             .subtitle(subtitle)
+            .tooltip_text(ipod.mount_path.display().to_string())
             .use_markup(false)
             .activatable(true)
             .build();
