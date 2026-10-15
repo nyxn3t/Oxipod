@@ -24,17 +24,22 @@ music on the window, and that's it.
   or when you added them. The list stays quick even with thousands of songs
 - Finds songs that are on the iPod twice and ticks the extra copies, so you
   can delete them in one go
-- Playlists: create them, add songs, remove songs
+- Playlists: create them, add songs, remove songs. Tick a few songs on a
+  playlist's page to take them off it or copy them in one go
 - Delete songs from the iPod, or select a bunch and delete them or add them
   to a playlist in one go
+- Fix the title, artist, album and album artist of a song, or of a bunch of
+  selected songs at once. This changes what the iPod shows, not your files
 - Copy songs back to your computer, all in one folder with names like
   `Artist - Title.mp3` or in folders by artist and album. One at a time, a
   whole selection, or everything on the iPod. Handy as a backup of your music
-- Offers to back up the iPod's database before you open it
+- Offers to back up the iPod's database before you open it, and puts a backup
+  back if something went wrong
 - Sets newer iPods (the classic, the nano from the 3rd generation on) up by
   itself the first time you open them, no terminal needed
 - Rename the iPod
-- Cleans up leftover files from syncs that got interrupted
+- Cleans up leftover files from syncs that got interrupted, and songs that are
+  in the list but whose files are gone
 - Ejects the iPod when you're done
 
 ## Installing
@@ -157,8 +162,16 @@ again", and the main menu has a switch to turn the question back on. The ⋮
 menu of an iPod also has "Back Up…" for whenever you want one, and "Copy All
 to Computer…" to save the music itself.
 
-To put a backup back, copy the `iPod_Control` folder from it onto the iPod.
-Every backup has a README.txt that says the same.
+To put a backup back, use "Restore from Backup…" in the same menu and pick the
+backup's folder. Oxipod checks that the backup is from this iPod, saves what is
+on the iPod right now in a folder you choose (so you can undo the restore), and
+then copies the song list and the covers back. Songs you added after the backup
+disappear from the list, and Oxipod offers to clean up their files. Songs you
+deleted since then show up in the list again without their files, and Oxipod
+offers to take them out of the list.
+
+You can also do it by hand: copy the `iPod_Control` folder from the backup onto
+the iPod. Every backup has a README.txt that says how.
 
 ## License
 
