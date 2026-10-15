@@ -57,30 +57,37 @@ iPod, so it should work with the models libgpod supports: the iPod classic,
 the mini and the nano up to the 4th generation.
 
 So far I've only tested it with an iPod nano 3rd gen. If you try it with
-something else, let me know how it goes in an issue. The About window (in the
-main menu) has a Troubleshooting section with the details to paste into it.
+something else, let me know how it goes: reply in
+[Which iPod do you have, and did it work?](https://github.com/nyxn3t/Oxipod/discussions/1),
+or open an issue (there's a form for it). The About window (in the main menu)
+has a Troubleshooting section with the details to paste.
 
 The touchscreen nanos (6th and 7th gen), the iPod touch and iPhones don't
 work.
 
 ### First time setup on newer models
 
-The nano 3rd gen and newer (and the iPod classic) need the iPod's description,
-with its model and its unique ID, to write a database the iPod accepts. Without
-it the iPod just looks empty, however many songs you add. Oxipod notices when
-an iPod is missing it, and offers to fix that when you open the iPod: it asks
-the iPod for the description and saves it on the iPod as a small file. Your
-system asks for your password to allow that. It happens once per iPod.
+The nano 3rd gen and newer (and the iPod classic) need a description of
+themselves, with their model and their unique ID, before Oxipod can write a
+database they accept. Without it the iPod just looks empty, however many songs
+you add. Oxipod notices when an iPod is missing it and offers to fix that when
+you open the iPod. Your system asks for your password to allow it, and it
+happens once per iPod.
 
-If that doesn't work, Oxipod shows you the command to run yourself. It's the
-one libgpod comes with, run once with the iPod mounted:
+<details>
+<summary>If that doesn't work</summary>
+
+Oxipod shows you the command to run yourself, with your drive filled in. It's
+the one libgpod comes with, run once with the iPod mounted:
 
 ```
 sudo ipod-read-sysinfo-extended /dev/sdX /run/media/$USER/YOUR_IPOD
 ```
 
-(replace `/dev/sdX` with your iPod's drive, `lsblk` shows it). This only adds
-a small file to the iPod too.
+(replace `/dev/sdX` with your iPod's drive, `lsblk` shows it). It only adds a
+small file to the iPod.
+
+</details>
 
 ## Building
 

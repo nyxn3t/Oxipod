@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Which iPod do you have?
+    url: https://github.com/nyxn3t/Oxipod/discussions/1
+    about: Tell me how Oxipod works on your iPod, even if nothing went wrong. A reply is enough, no form needed.
