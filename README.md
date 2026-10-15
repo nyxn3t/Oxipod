@@ -18,15 +18,20 @@ music on the window, and that's it.
 - Converts stuff the iPod can't play (FLAC, Opus, Ogg, WAV, WebM, ...) to MP3
   on the fly. MP3 and AAC/ALAC files are copied as they are
 - Copies cover art, either from the file or from a `cover.jpg` in the album
-  folder
+  folder. You can also pick a cover yourself for a song, a whole album or a
+  bunch of selected songs, and a filter shows the songs that don't have one
 - Search the songs on the iPod (Ctrl+F) and sort them by title, artist, album
   or when you added them. The list stays quick even with thousands of songs
+- Finds songs that are on the iPod twice and ticks the extra copies, so you
+  can delete them in one go
 - Playlists: create them, add songs, remove songs
 - Delete songs from the iPod, or select a bunch and delete them or add them
   to a playlist in one go
-- Copy songs back to your computer with readable names like
-  `Artist - Title.mp3`, one at a time or a whole selection. Handy as a backup
-  too
+- Copy songs back to your computer, all in one folder with names like
+  `Artist - Title.mp3` or in folders by artist and album. One at a time, a
+  whole selection, or everything on the iPod. Handy as a backup of your music
+- Offers to back up the iPod's database before you open it
+- Rename the iPod
 - Cleans up leftover files from syncs that got interrupted
 - Ejects the iPod when you're done
 
@@ -50,7 +55,8 @@ iPod, so it should work with the models libgpod supports: the iPod classic,
 the mini and the nano up to the 4th generation.
 
 So far I've only tested it with an iPod nano 3rd gen. If you try it with
-something else, let me know how it goes in an issue.
+something else, let me know how it goes in an issue. The About window (in the
+main menu) has a Troubleshooting section with the details to paste into it.
 
 The touchscreen nanos (6th and 7th gen), the iPod touch and iPhones don't
 work.
@@ -95,9 +101,16 @@ flatpak run org.flatpak.Builder --user --install --force-clean flatpak/build fla
 
 ## Before you use it
 
-Back up the `iPod_Control` folder on your iPod first. Oxipod has worked fine on
-mine, but it's a young app writing to a database format Apple never
-documented, so better safe than sorry.
+Oxipod has worked fine on mine, but it's a young app writing to a database
+format Apple never documented, so better safe than sorry. When you open an
+iPod, Oxipod offers to back up its database: the song list and the covers,
+about 100 MB on a nano, not the music. Say yes. You can tick "Don't ask
+again", and the main menu has a switch to turn the question back on. The ⋮
+menu of an iPod also has "Back Up…" for whenever you want one, and "Copy All
+to Computer…" to save the music itself.
+
+To put a backup back, copy the `iPod_Control` folder from it onto the iPod.
+Every backup has a README.txt that says the same.
 
 ## License
 
