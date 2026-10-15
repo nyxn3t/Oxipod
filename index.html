@@ -14,17 +14,23 @@
 <body>
 <h1>Oxipod</h1>
 <p>Put music on your old iPod from Linux. This is Oxipod's own Flatpak repository: add it once, and new
-releases show up in your software center and with <code>flatpak update</code>.</p>
+releases show up in your software center and with <code>flatpak update</code>. You need
+<a href="https://flatpak.org/setup/">Flatpak</a> on your system.</p>
 
 <pre><code>flatpak remote-add --user --if-not-exists oxipod https://nyxn3t.github.io/Oxipod/oxipod.flatpakrepo
 flatpak install --user oxipod io.github.nyxn3t.Oxipod</code></pre>
 
 <p>Or open <a href="oxipod.flatpakref">oxipod.flatpakref</a> with your software center.</p>
 
-<p>This is not Flathub. Adding the repository means you trust me to ship updates; they are signed with this
-key: <code>899048DA42D4FA507EC6F01FA9A4E497D0B17C45</code>.</p>
+<p>This is not Flathub. Adding the repository means you trust me, nyxn3t, the author of Oxipod, to ship
+updates. They are signed with this key, which Flatpak checks for you:</p>
+<p><code>8990 48DA 42D4 FA50 7EC6 F01F A9A4 E497 D0B1 7C45</code></p>
+<p>The same fingerprint is in <a href="https://github.com/nyxn3t/Oxipod#installing">the README on GitHub</a>,
+so you can compare the two.</p>
 
-<p><a href="https://github.com/nyxn3t/Oxipod">Oxipod on GitHub</a>: the source, the releases with a plain
-<code>.flatpak</code> file, and the place to say how it works on your iPod.</p>
+<p>Oxipod should work with the iPod classic, the mini and the nano up to the 4th generation, and so far it
+has only been tried on a nano 3rd gen (<a href="https://github.com/nyxn3t/Oxipod#which-ipods-work">more
+about which iPods work</a>). <a href="https://github.com/nyxn3t/Oxipod">Oxipod on GitHub</a> has the source,
+the releases with a plain <code>.flatpak</code> file, and a place to say how it works on your iPod.</p>
 </body>
 </html>
