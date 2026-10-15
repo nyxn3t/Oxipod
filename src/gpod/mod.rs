@@ -221,6 +221,33 @@ impl Database {
         }
     }
 
+    /// Whether this iPod still needs its first-time setup (see `sysinfo.rs`).
+    ///
+    /// Newer iPods only accept a song list with a checksum, and libgpod can
+    /// only work that out when it knows the iPod's model and its unique ID.
+    /// So this is true for an iPod libgpod can't identify (it might need a
+    /// checksum), and for one that does need a checksum while its ID is
+    /// unknown. The iPod's own description (`SysInfoExtended`) fixes both; the
+    /// caller checks whether that file is there already.
+    pub fn needs_first_time_setup(&self) -> bool {
+        // SAFETY: the device is owned by the database, and the info table is a
+        // static table inside libgpod. `itdb_device_get_sysinfo` gives a copy
+        // of the text (or NULL), which is freed here.
+        unsafe {
+            let device = (*self.raw()).device;
+            let info = ffi::itdb_device_get_ipod_info(device);
+            let generation = if info.is_null() {
+                ffi::Itdb_IpodGeneration_ITDB_IPOD_GENERATION_UNKNOWN
+            } else {
+                (*info).ipod_generation
+            };
+            let id = ffi::itdb_device_get_sysinfo(device, c"FirewireGuid".as_ptr());
+            let has_id = !id.is_null();
+            ffi::g_free(id.cast());
+            setup_needed(generation, has_id)
+        }
+    }
+
     /// Every song in the database.
     pub fn tracks(&self) -> Vec<Track> {
         self.track_ptrs()
@@ -621,6 +648,35 @@ fn random_id(taken: impl Fn(u64) -> bool) -> u64 {
     }
 }
 
+/// The rule behind `Database::needs_first_time_setup`.
+fn setup_needed(generation: ffi::Itdb_IpodGeneration, has_firewire_id: bool) -> bool {
+    use ffi::*;
+
+    // The iPods that want a checksum in the song list. (libgpod works with
+    // the classic and the nano up to the 4th generation; the newer ones are
+    // here because they need the same thing, whether or not they work.)
+    let wants_checksum = [
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_CLASSIC_1,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_CLASSIC_2,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_CLASSIC_3,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_NANO_3,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_NANO_4,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_NANO_5,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_NANO_6,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_TOUCH_1,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_TOUCH_2,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_TOUCH_3,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_TOUCH_4,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_IPHONE_1,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_IPHONE_2,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_IPHONE_3,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_IPHONE_4,
+        Itdb_IpodGeneration_ITDB_IPOD_GENERATION_IPAD_1,
+    ]
+    .contains(&generation);
+    generation == Itdb_IpodGeneration_ITDB_IPOD_GENERATION_UNKNOWN || (wants_checksum && !has_firewire_id)
+}
+
 /// Copies the fields we show out of a libgpod track.
 ///
 /// # Safety
@@ -741,6 +797,36 @@ unsafe fn take_error(error: *mut ffi::GError) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn works_out_which_ipods_need_the_first_time_setup() {
+        use super::ffi::*;
+        use super::setup_needed;
+
+        // An iPod libgpod can't identify might want a checksum: ask it.
+        assert!(setup_needed(Itdb_IpodGeneration_ITDB_IPOD_GENERATION_UNKNOWN, false));
+        assert!(setup_needed(Itdb_IpodGeneration_ITDB_IPOD_GENERATION_UNKNOWN, true));
+        // The ones that want a checksum need to know their ID.
+        for generation in [
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_CLASSIC_1,
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_CLASSIC_3,
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_NANO_3,
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_NANO_4,
+        ] {
+            assert!(setup_needed(generation, false), "generation {generation}");
+            assert!(!setup_needed(generation, true), "generation {generation}");
+        }
+        // The older ones take any song list.
+        for generation in [
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_MINI_2,
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_NANO_1,
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_NANO_2,
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_VIDEO_2,
+            Itdb_IpodGeneration_ITDB_IPOD_GENERATION_SHUFFLE_2,
+        ] {
+            assert!(!setup_needed(generation, false), "generation {generation}");
+        }
+    }
+
     use super::*;
 
     // Run with: OXIPOD_TEST_IPOD=/run/media/... cargo test -- --ignored --nocapture

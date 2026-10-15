@@ -9,6 +9,8 @@ mod gpod;
 mod library;
 mod settings;
 mod songs;
+mod sysinfo;
+mod udisks;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -40,6 +42,8 @@ struct Context {
     /// The iPods (by mount path) that were backed up since the app started:
     /// they aren't offered another backup right away.
     backed_up: Rc<RefCell<HashSet<PathBuf>>>,
+    /// True while an iPod is being opened, so a second click doesn't open it twice.
+    opening: Rc<Cell<bool>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -143,6 +147,7 @@ fn build_ui(app: &adw::Application) {
         navigation: navigation.clone(),
         open_library,
         backed_up: Rc::default(),
+        opening: Rc::default(),
     };
 
     // The volume monitor tells us when drives are mounted or unmounted.
@@ -180,10 +185,8 @@ fn build_ui(app: &adw::Application) {
     {
         let context = context.clone();
         copy_all.connect_activate(move |_, target| {
-            if let Some(mount_path) = target.and_then(|target| target.str())
-                && let Some(library) = open_ipod(Path::new(mount_path), &context)
-            {
-                library.copy_all();
+            if let Some(mount_path) = target.and_then(|target| target.str()) {
+                open_ipod_soon(&context, PathBuf::from(mount_path), |library| library.copy_all());
             }
         });
     }
@@ -287,6 +290,101 @@ fn debug_info() -> String {
     lines.join("\n")
 }
 
+/// Opens an iPod's page, then runs `then` with it. An iPod that needs its
+/// first-time setup (see `sysinfo.rs`) gets it first, which takes a moment.
+fn open_ipod_soon(context: &Context, mount_path: PathBuf, then: impl FnOnce(&Rc<Library>) + 'static) {
+    if context.opening.replace(true) {
+        return;
+    }
+    let context = context.clone();
+    glib::spawn_future_local(async move {
+        let prepared = prepare_ipod(&context, &mount_path).await;
+        let library = open_ipod(&mount_path, &context);
+        context.opening.set(false);
+        let Some(library) = library else {
+            return;
+        };
+        match prepared {
+            Prepared::Nothing => {}
+            Prepared::SetUp => library.toast("This iPod is set up: Oxipod saved a small file that describes it"),
+            Prepared::Failed(failure) => show_setup_help(&context, &failure),
+        }
+        then(&library);
+    });
+}
+
+/// What happened before an iPod was opened.
+enum Prepared {
+    Nothing,
+    SetUp,
+    Failed(sysinfo::Failure),
+}
+
+/// Does the first-time setup of an iPod, if it needs one and the person agrees.
+async fn prepare_ipod(context: &Context, mount_path: &Path) -> Prepared {
+    if !sysinfo::needs_setup(mount_path).await {
+        return Prepared::Nothing;
+    }
+
+    // The system is going to ask for a password, so say why first.
+    let dialog = adw::AlertDialog::new(
+        Some("Set Up Your iPod?"),
+        Some(
+            "This iPod needs a one-time setup before Oxipod can add songs to it. Oxipod asks the iPod \
+             for its description (its model and unique ID) and saves it on the iPod as a small file. \
+             Your system will ask for your password to allow that. Without the setup, songs you add \
+             may not show up on the iPod.",
+        ),
+    );
+    dialog.add_responses(&[("skip", "Not Now"), ("setup", "Set Up")]);
+    dialog.set_response_appearance("setup", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("setup"));
+    dialog.set_close_response("skip");
+    if dialog.choose_future(Some(&context.window)).await != "setup" {
+        return Prepared::Nothing;
+    }
+
+    // While the system asks and the iPod answers, a small window says so.
+    let waiting = adw::AlertDialog::new(Some("Setting Up Your iPod…"), Some("Waiting for you to allow it, then for the iPod."));
+    waiting.set_extra_child(Some(&gtk::Spinner::builder().spinning(true).height_request(32).build()));
+    waiting.set_can_close(false);
+    waiting.present(Some(&context.window));
+    let result = sysinfo::set_up(mount_path).await;
+    waiting.set_can_close(true);
+    waiting.force_close();
+
+    match result {
+        Ok(()) => Prepared::SetUp,
+        Err(failure) => Prepared::Failed(failure),
+    }
+}
+
+/// Explains how to do the first-time setup by hand, when Oxipod couldn't.
+fn show_setup_help(context: &Context, failure: &sysinfo::Failure) {
+    let body = format!(
+        "Oxipod couldn't set this iPod up ({}). Until it is done, songs you add may not show up on \
+         the iPod. To do it by hand, run this in a terminal while the iPod is plugged in, then open \
+         the iPod again:",
+        failure.reason
+    );
+    let dialog = adw::AlertDialog::new(Some("This iPod Isn't Set Up"), Some(&body));
+    let command_label = gtk::Label::builder()
+        .label(&failure.command)
+        .selectable(true)
+        .wrap(true)
+        .css_classes(["monospace"])
+        .build();
+    dialog.set_extra_child(Some(&command_label));
+    dialog.add_responses(&[("close", "Close"), ("copy", "Copy Command")]);
+    dialog.set_response_appearance("copy", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("copy"));
+    dialog.set_close_response("close");
+
+    let (window, command) = (context.window.clone(), failure.command.clone());
+    dialog.connect_response(Some("copy"), move |_, _| window.clipboard().set_text(&command));
+    dialog.present(Some(&context.window));
+}
+
 /// A message with a Close button.
 fn show_error(context: &Context, heading: &str, message: &str) {
     let dialog = adw::AlertDialog::new(Some(heading), Some(message));
@@ -305,7 +403,7 @@ fn open_ipod_after_offer(context: &Context, mount_path: PathBuf, name: String) {
     let size = match size {
         Ok(size) if !no_offer => size,
         _ => {
-            open_ipod(&mount_path, context);
+            open_ipod_soon(context, mount_path, |_| {});
             return;
         }
     };
@@ -335,9 +433,7 @@ fn open_ipod_after_offer(context: &Context, mount_path: PathBuf, name: String) {
         }
         match response {
             "backup" => start_backup(context, mount_path.clone(), name.clone(), true),
-            _ => {
-                open_ipod(&mount_path, context);
-            }
+            _ => open_ipod_soon(context, mount_path.clone(), |_| {}),
         }
     });
     dialog.present(Some(&context.window));
@@ -553,7 +649,7 @@ fn show_backup_done(context: &Context, mount_path: PathBuf, done: backup::Done, 
             });
         }
         if open_after {
-            open_ipod(&mount_path, context);
+            open_ipod_soon(context, mount_path.clone(), |_| {});
         }
     });
     dialog.present(Some(&context.window));

@@ -63,18 +63,22 @@ work.
 
 ### First time setup on newer models
 
-The nano 3rd gen and newer need the iPod's unique ID to write a database the
-iPod accepts. libgpod normally reads it automatically when you plug the iPod
-in, but that doesn't work on most current distros. If your songs don't show up
-on the iPod after adding them, run this once with the iPod mounted:
+The nano 3rd gen and newer (and the iPod classic) need the iPod's description,
+with its model and its unique ID, to write a database the iPod accepts. Without
+it the iPod just looks empty, however many songs you add. Oxipod notices when
+an iPod is missing it, and offers to fix that when you open the iPod: it asks
+the iPod for the description and saves it on the iPod as a small file. Your
+system asks for your password to allow that. It happens once per iPod.
+
+If that doesn't work, Oxipod shows you the command to run yourself. It's the
+one libgpod comes with, run once with the iPod mounted:
 
 ```
 sudo ipod-read-sysinfo-extended /dev/sdX /run/media/$USER/YOUR_IPOD
 ```
 
 (replace `/dev/sdX` with your iPod's drive, `lsblk` shows it). This only adds
-a small file to the iPod. I want to make Oxipod do this by itself at some
-point.
+a small file to the iPod too.
 
 ## Building
 

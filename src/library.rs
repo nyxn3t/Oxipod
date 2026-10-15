@@ -966,7 +966,7 @@ impl Library {
         result.is_ok()
     }
 
-    fn toast(&self, message: &str) {
+    pub fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(message)));
     }
 
