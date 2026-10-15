@@ -27,6 +27,7 @@
       <li>Delete songs from the iPod, one at a time or several at once</li>
       <li>Copy songs back to your computer, in folders by artist and album if you like</li>
       <li>Offers to back up the iPod's database before you open it</li>
+      <li>Sets newer iPods up by itself the first time you open them</li>
       <li>Finds and cleans up leftover files from interrupted syncs</li>
     </ul>
     <p>
@@ -40,11 +41,11 @@
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.5.0/data/screenshots/songs.png</image>
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.6.0/data/screenshots/songs.png</image>
       <caption>The songs on an iPod nano</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.5.0/data/screenshots/search.png</image>
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.6.0/data/screenshots/search.png</image>
       <caption>Searching the songs</caption>
     </screenshot>
   </screenshots>
@@ -74,6 +75,15 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.6.0" date="2026-10-15">
+      <description>
+        <p>Newer iPods set themselves up.</p>
+        <ul>
+          <li>The iPod classic and the nano from the 3rd generation on need a description of themselves before Oxipod can write to them. Oxipod now fetches it the first time you open the iPod, so you no longer need a command in a terminal</li>
+          <li>If that doesn't work, Oxipod shows the command to run by hand, with your drive filled in</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-10-15">
       <description>
         <p>Pick covers, find duplicates, and a backup before you start.</p>

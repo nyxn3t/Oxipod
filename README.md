@@ -31,6 +31,8 @@ music on the window, and that's it.
   `Artist - Title.mp3` or in folders by artist and album. One at a time, a
   whole selection, or everything on the iPod. Handy as a backup of your music
 - Offers to back up the iPod's database before you open it
+- Sets newer iPods (the classic, the nano from the 3rd generation on) up by
+  itself the first time you open them, no terminal needed
 - Rename the iPod
 - Cleans up leftover files from syncs that got interrupted
 - Ejects the iPod when you're done
