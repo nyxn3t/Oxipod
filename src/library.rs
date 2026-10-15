@@ -2,7 +2,7 @@
 //! editing playlists, copying songs back to the computer, and ejecting.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
@@ -113,11 +113,31 @@ struct ExportJob {
     relative: PathBuf,
 }
 
+/// What lets the songs on a playlist page be ticked, like on the Songs tab.
+#[derive(Clone)]
+struct Ticks {
+    /// The page's select button. The rows follow it: in selection mode a check
+    /// box takes the place of a row's menu.
+    select_button: gtk::ToggleButton,
+    /// The songs that are ticked.
+    ticked: Rc<RefCell<HashSet<TrackId>>>,
+    /// Runs when a tick changes, so the bar at the bottom can follow along.
+    changed: Rc<dyn Fn()>,
+}
+
 struct OpenPlaylist {
     id: PlaylistId,
     page: adw::NavigationPage,
     group: adw::PreferencesGroup,
     list: gtk::ListBox,
+    ticks: Ticks,
+    /// The songs that are on the page, in the playlist's order.
+    ids: RefCell<Vec<TrackId>>,
+    /// The bar at the bottom while songs are being ticked.
+    label: gtk::Label,
+    all_button: gtk::Button,
+    copy_button: gtk::Button,
+    remove_button: gtk::Button,
 }
 
 impl Library {
@@ -792,12 +812,19 @@ impl Library {
                 Some(playlist) => {
                     open.page.set_title(&playlist.name);
                     open.group.set_title(&songs_count(playlist.track_ids.len()));
+                    // A playlist can name a song that is gone: show the others.
+                    let by_id: HashMap<TrackId, &Track> = tracks.iter().map(|track| (track.id, track)).collect();
+                    let present: Vec<TrackId> = playlist.track_ids.iter().copied().filter(|id| by_id.contains_key(id)).collect();
+                    // A tick only stays while its song is on the page.
+                    open.ticks.ticked.borrow_mut().retain(|id| present.contains(id));
+                    open.ids.replace(present);
                     open.list.remove_all();
                     for id in &playlist.track_ids {
-                        if let Some(track) = tracks.iter().find(|track| track.id == *id) {
-                            open.list.append(&self.song_row(track, &playlists, Some(playlist.id)));
+                        if let Some(track) = by_id.get(id) {
+                            open.list.append(&self.song_row(track, &playlists, Some(playlist.id), Some(&open.ticks)));
                         }
                     }
+                    self.update_playlist_bar();
                 }
                 None => playlist_deleted = true,
             }
@@ -810,13 +837,14 @@ impl Library {
     }
 
     /// A song on a playlist page, with its cover and a menu. `in_playlist` is
-    /// set there, to offer "Remove from Playlist". (The main song list builds
-    /// its rows in `songs.rs`.)
+    /// set there, to offer "Remove from Playlist", and `ticks` lets the song be
+    /// ticked. (The main song list builds its rows in `songs.rs`.)
     fn song_row(
         &self,
         track: &Track,
         playlists: &[gpod::Playlist],
         in_playlist: Option<PlaylistId>,
+        ticks: Option<&Ticks>,
     ) -> adw::ActionRow {
         let subtitle = [track.artist.as_deref(), track.album.as_deref()]
             .into_iter()
@@ -828,6 +856,19 @@ impl Library {
             .subtitle(subtitle)
             .use_markup(false)
             .build();
+
+        // The check box comes first, to the left of the cover. It is only
+        // shown in selection mode, where it takes the place of the menu.
+        let check = ticks.map(|ticks| {
+            let check = gtk::CheckButton::builder()
+                .valign(gtk::Align::Center)
+                .css_classes(["selection-mode"])
+                .build();
+            // Set before the handler is connected, so it doesn't count as a change.
+            check.set_active(ticks.ticked.borrow().contains(&track.id));
+            row.add_prefix(&check);
+            check
+        });
 
         let cover = gtk::Image::builder().pixel_size(COVER_SIZE).build();
         show_cover(&cover, self.cover(track.id).as_ref());
@@ -847,6 +888,31 @@ impl Library {
             .tooltip_text("More")
             .build();
         row.add_suffix(&menu_button);
+
+        if let (Some(ticks), Some(check)) = (ticks, check) {
+            // Property bindings keep one property equal to another (see `songs.rs`).
+            ticks.select_button.bind_property("active", &check, "visible").sync_create().build();
+            ticks.select_button.bind_property("active", &menu_button, "visible").sync_create().invert_boolean().build();
+            ticks.select_button.bind_property("active", &row, "activatable").sync_create().build();
+
+            let (id, ticked, changed) = (track.id, ticks.ticked.clone(), ticks.changed.clone());
+            check.connect_toggled(move |check| {
+                if check.is_active() {
+                    ticked.borrow_mut().insert(id);
+                } else {
+                    ticked.borrow_mut().remove(&id);
+                }
+                changed();
+            });
+            // Clicking the row ticks it. The row must not hold on to its own
+            // child (that would be a loop nothing could free), so only weakly.
+            let check = check.downgrade();
+            row.connect_activated(move |_| {
+                if let Some(check) = check.upgrade() {
+                    check.set_active(!check.is_active());
+                }
+            });
+        }
         row
     }
 
@@ -1192,6 +1258,11 @@ impl Library {
     /// could get in its way is switched off, and the progress bar shows up.
     /// Only a job that can be cancelled shows the Cancel button.
     fn begin_job(&self, cancellable: bool) {
+        // The progress shows on this page, so a playlist page on top of it goes away.
+        let playlist_open = self.open_playlist.borrow().is_some();
+        if playlist_open {
+            self.navigation.pop_to_page(&self.page);
+        }
         self.select_button.set_active(false);
         self.select_button.set_sensitive(false);
         self.add_button.set_sensitive(false);
@@ -1743,26 +1814,218 @@ impl Library {
             .action_name("library.delete-playlist")
             .action_target(&id.to_variant())
             .build();
+        // Like on the Songs tab: tick songs to do something with several at once.
+        let select_button = gtk::ToggleButton::builder()
+            .icon_name("selection-mode-symbolic")
+            .tooltip_text("Select Songs")
+            .build();
         let header = adw::HeaderBar::new();
         header.pack_end(&delete_button);
+        header.pack_end(&select_button);
+
+        // The bar at the bottom, while songs are being ticked.
+        let label = gtk::Label::builder().ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let all_button = gtk::Button::with_label("Select All");
+        let copy_button = gtk::Button::with_label("Copy to Computer");
+        let remove_button = gtk::Button::with_label("Remove from Playlist");
+        let bar = gtk::ActionBar::new();
+        bar.pack_start(&all_button);
+        bar.set_center_widget(Some(&label));
+        bar.pack_end(&remove_button);
+        bar.pack_end(&copy_button);
+
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&content));
+        toolbar.add_bottom_bar(&bar);
+        toolbar.set_reveal_bottom_bars(false);
 
         let page = adw::NavigationPage::new(&toolbar, "Playlist");
         // The song menus on this page use the same actions as the main page.
         page.insert_action_group("library", Some(&self.actions));
 
         let this: Weak<Self> = Rc::downgrade(self);
-        page.connect_hidden(move |_| {
-            if let Some(this) = this.upgrade() {
-                this.open_playlist.replace(None);
+        page.connect_hidden({
+            let this = this.clone();
+            move |_| {
+                if let Some(this) = this.upgrade() {
+                    this.open_playlist.replace(None);
+                    // The select button may have turned this off.
+                    this.navigation.set_pop_on_escape(true);
+                }
             }
         });
 
-        self.open_playlist.replace(Some(OpenPlaylist { id, page: page.clone(), group, list }));
+        let ticks = Ticks {
+            select_button: select_button.clone(),
+            ticked: Rc::default(),
+            changed: {
+                let this = this.clone();
+                Rc::new(move || {
+                    if let Some(this) = this.upgrade() {
+                        this.update_playlist_bar();
+                    }
+                })
+            },
+        };
+
+        // Selection mode starts and ends with nothing ticked. The rows are
+        // built again, which sets their check boxes.
+        select_button.connect_toggled({
+            // The toolbar only weakly: the button sits inside it, and a button that holds on to
+            // the toolbar that holds the button is a loop nothing could free.
+            let (this, toolbar, ticked) = (this.clone(), toolbar.downgrade(), ticks.ticked.clone());
+            move |button| {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                if button.is_active() && this.busy.get() {
+                    button.set_active(false);
+                    this.toast("Wait until the current job is done");
+                    return;
+                }
+                ticked.borrow_mut().clear();
+                if let Some(toolbar) = toolbar.upgrade() {
+                    toolbar.set_reveal_bottom_bars(button.is_active());
+                }
+                // Esc should leave selection mode here, not the whole page.
+                this.navigation.set_pop_on_escape(!button.is_active());
+                this.refresh();
+            }
+        });
+        all_button.connect_clicked({
+            let this = this.clone();
+            move |_| {
+                if let Some(this) = this.upgrade() {
+                    this.toggle_select_all_in_playlist();
+                }
+            }
+        });
+        copy_button.connect_clicked({
+            let this = this.clone();
+            move |_| {
+                if let Some(this) = this.upgrade() {
+                    this.choose_export_folder(this.ticked_songs());
+                }
+            }
+        });
+        remove_button.connect_clicked({
+            let (this, select_button) = (this.clone(), select_button.clone());
+            move |_| {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                let ids = this.ticked_songs();
+                let name = this.playlist_name(id);
+                // If it fails, the ticks stay, so it can be tried again.
+                if this.change(|db| ids.iter().try_for_each(|&song| db.remove_from_playlist(id, song))) {
+                    select_button.set_active(false);
+                    this.toast(&format!("Removed {} from “{name}”", songs_count(ids.len())));
+                }
+            }
+        });
+
+        // Esc leaves selection mode and Ctrl+A ticks every song, as on the Songs tab.
+        let shortcuts = gtk::ShortcutController::new();
+        let button = select_button.clone();
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("Escape"),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                if button.is_active() {
+                    button.set_active(false);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            })),
+        ));
+        let (button, weak) = (select_button.clone(), this.clone());
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control>a"),
+            Some(gtk::CallbackAction::new(move |_, _| match weak.upgrade() {
+                Some(this) if !this.busy.get() => {
+                    button.set_active(true);
+                    this.tick_all_in_playlist(true);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            })),
+        ));
+        toolbar.add_controller(shortcuts);
+
+        self.open_playlist.replace(Some(OpenPlaylist {
+            id,
+            page: page.clone(),
+            group,
+            list,
+            ticks,
+            ids: RefCell::default(),
+            label,
+            all_button,
+            copy_button,
+            remove_button,
+        }));
         self.refresh();
         self.navigation.push(&page);
+    }
+
+    /// The ticked songs of the open playlist page, in the playlist's order.
+    fn ticked_songs(&self) -> Vec<TrackId> {
+        match self.open_playlist.borrow().as_ref() {
+            Some(open) => ticked_in_order(&open.ids.borrow(), &open.ticks.ticked.borrow()),
+            None => Vec::new(),
+        }
+    }
+
+    /// Ticks every song of the open playlist page, or unticks them all.
+    fn tick_all_in_playlist(&self, on: bool) {
+        {
+            let open = self.open_playlist.borrow();
+            let Some(open) = open.as_ref() else {
+                return;
+            };
+            let mut ticked = open.ticks.ticked.borrow_mut();
+            ticked.clear();
+            if on {
+                ticked.extend(open.ids.borrow().iter().copied());
+            }
+        }
+        // The rows are built again, which sets their check boxes.
+        self.refresh();
+    }
+
+    /// The "Select All" button of a playlist page: ticks everything, or unticks
+    /// everything when it all is ticked already.
+    fn toggle_select_all_in_playlist(&self) {
+        let all_ticked = {
+            let open = self.open_playlist.borrow();
+            let Some(open) = open.as_ref() else {
+                return;
+            };
+            let total = open.ids.borrow().len();
+            total > 0 && open.ticks.ticked.borrow().len() == total
+        };
+        self.tick_all_in_playlist(!all_ticked);
+    }
+
+    /// Brings the bar at the bottom of the open playlist page up to date.
+    fn update_playlist_bar(&self) {
+        let open = self.open_playlist.borrow();
+        let Some(open) = open.as_ref() else {
+            return;
+        };
+        let ticked = open.ticks.ticked.borrow().len();
+        let total = open.ids.borrow().len();
+        open.label.set_text(&match ticked {
+            0 => "Select songs".to_string(),
+            count => format!("{} selected", songs_count(count)),
+        });
+        // Copying only reads from the iPod; taking songs off a playlist changes it.
+        open.remove_button.set_sensitive(ticked > 0 && !self.read_only);
+        open.copy_button.set_sensitive(ticked > 0);
+        let all_ticked = total > 0 && ticked == total;
+        open.all_button.set_label(if all_ticked { "Select None" } else { "Select All" });
+        open.all_button.set_sensitive(total > 0);
     }
 
     fn eject(self: &Rc<Self>) {
@@ -1931,6 +2194,11 @@ pub fn read_only_dialog(filesystem: Option<&str>) -> adw::AlertDialog {
     dialog
 }
 
+/// The ticked songs among `ids`, in the order of `ids` (a playlist's order).
+fn ticked_in_order(ids: &[TrackId], ticked: &HashSet<TrackId>) -> Vec<TrackId> {
+    ids.iter().copied().filter(|id| ticked.contains(id)).collect()
+}
+
 fn songs_count(count: usize) -> String {
     if count == 1 { "1 song".into() } else { format!("{count} songs") }
 }
@@ -1990,6 +2258,14 @@ mod tests {
         ];
         assert_eq!(album_of(&tracks, 2), Some((" voluntary grief ".to_string(), vec![1, 2])));
         assert_eq!(album_of(&tracks, 3), Some(("Scarred Summer".to_string(), vec![3])));
+    }
+
+    #[test]
+    fn ticked_songs_come_in_the_playlists_order() {
+        let ticked: HashSet<TrackId> = [30, 10, 99].into_iter().collect();
+        // 99 isn't on the playlist (any more), and the order is the playlist's, not the ticks'.
+        assert_eq!(ticked_in_order(&[10, 20, 30], &ticked), [10, 30]);
+        assert!(ticked_in_order(&[10, 20], &HashSet::new()).is_empty());
     }
 
     #[test]
