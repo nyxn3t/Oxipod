@@ -1,6 +1,6 @@
 //! Finding iPods among the drives the desktop has mounted, and renaming them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gtk::gio;
 use gtk::prelude::*;
@@ -44,6 +44,11 @@ pub fn find_ipods(monitor: &gio::VolumeMonitor) -> Vec<Ipod> {
             })
         })
         .collect()
+}
+
+/// Free space on the drive that `path` is on, in bytes, if it can be read.
+pub fn free_space(path: &Path) -> Option<u64> {
+    disk_space(&gio::File::for_path(path)).ok().map(|(free, _total)| free)
 }
 
 /// Free and total space of the filesystem `root` lives on, in bytes.

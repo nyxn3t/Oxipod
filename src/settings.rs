@@ -7,6 +7,9 @@
 //! ```text
 //! [copy]
 //! layout=folders
+//!
+//! [backup]
+//! ask=false
 //! ```
 //!
 //! GLib's `KeyFile` reads and writes this kind of file. A missing or broken
@@ -49,8 +52,29 @@ impl Settings {
     }
 
     pub fn set_copy_layout(&self, layout: Layout) {
+        self.reload();
         self.file.set_string("copy", "layout", layout.id());
         self.save();
+    }
+
+    /// Whether to offer a backup when an iPod is opened. Yes, until the
+    /// person says "don't ask again".
+    pub fn ask_for_backup(&self) -> bool {
+        self.file.boolean("backup", "ask").unwrap_or(true)
+    }
+
+    pub fn set_ask_for_backup(&self, ask: bool) {
+        self.reload();
+        self.file.set_boolean("backup", "ask", ask);
+        self.save();
+    }
+
+    /// Reads the file again before a change is made. Several parts of the app
+    /// have a `Settings` of their own, and each only knows what the file said
+    /// when it was made; without this, saving one setting would put back the
+    /// old value of another one that was changed in the meantime.
+    fn reload(&self) {
+        let _ = self.file.load_from_file(&self.path, glib::KeyFileFlags::NONE);
     }
 
     fn save(&self) {
@@ -88,11 +112,40 @@ mod tests {
     }
 
     #[test]
+    fn asks_for_a_backup_until_told_not_to() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("settings.ini");
+        assert!(Settings::at(path.clone()).ask_for_backup());
+
+        Settings::at(path.clone()).set_ask_for_backup(false);
+        assert!(!Settings::at(path.clone()).ask_for_backup());
+
+        Settings::at(path.clone()).set_ask_for_backup(true);
+        assert!(Settings::at(path).ask_for_backup());
+    }
+
+    #[test]
+    fn two_settings_objects_do_not_undo_each_other() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("settings.ini");
+        // Both were made before either changed anything.
+        let first = Settings::at(path.clone());
+        let second = Settings::at(path.clone());
+        second.set_ask_for_backup(false);
+        first.set_copy_layout(Layout::Folders);
+
+        let settings = Settings::at(path);
+        assert!(!settings.ask_for_backup());
+        assert_eq!(settings.copy_layout(), Layout::Folders);
+    }
+
+    #[test]
     fn a_broken_file_means_the_defaults() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("settings.ini");
         fs::write(&path, "this is [not\nan ini file at all =").unwrap();
         assert_eq!(Settings::at(path.clone()).copy_layout(), Layout::Flat);
+        assert!(Settings::at(path.clone()).ask_for_backup());
         // ...and a nonsense value is ignored too.
         fs::write(&path, "[copy]\nlayout=spiral\n").unwrap();
         assert_eq!(Settings::at(path).copy_layout(), Layout::Flat);

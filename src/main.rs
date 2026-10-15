@@ -1,3 +1,4 @@
+mod backup;
 mod convert;
 mod covers;
 mod device;
@@ -9,20 +10,37 @@ mod library;
 mod settings;
 mod songs;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 
 use library::Library;
+use settings::Settings;
 
 const APP_ID: &str = "io.github.nyxn3t.Oxipod";
 
 /// The iPod page that is open, if any. Shared between the signal handlers
 /// below, hence `Rc<RefCell<…>>`: shared ownership, changeable contents.
 type OpenLibrary = Rc<RefCell<Option<Rc<Library>>>>;
+
+/// What the device list needs to open an iPod, and to offer a backup first.
+/// Cloning it is cheap: every part is a reference to the same thing.
+#[derive(Clone)]
+struct Context {
+    window: adw::ApplicationWindow,
+    navigation: adw::NavigationView,
+    open_library: OpenLibrary,
+    /// The iPods (by mount path) that were backed up since the app started:
+    /// they aren't offered another backup right away.
+    backed_up: Rc<RefCell<HashSet<PathBuf>>>,
+}
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
@@ -60,6 +78,16 @@ fn build_ui(app: &adw::Application) {
     stack.add_named(&device_page, Some("devices"));
 
     let header = adw::HeaderBar::new();
+    let main_menu = gio::Menu::new();
+    main_menu.append(Some("Offer a Backup When Opening an iPod"), Some("win.ask-backup"));
+    header.pack_end(
+        &gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .menu_model(&main_menu)
+            .primary(true)
+            .tooltip_text("Main Menu")
+            .build(),
+    );
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&stack));
@@ -90,13 +118,30 @@ fn build_ui(app: &adw::Application) {
         }
     });
 
+    // The switch in the main menu. A stateful action with a true/false state
+    // is drawn as a check mark, and activating it flips the state.
+    let ask_backup = gio::SimpleAction::new_stateful("ask-backup", None, &Settings::load().ask_for_backup().to_variant());
+    ask_backup.connect_change_state(|action, state| {
+        if let Some(ask) = state.and_then(|state| state.get::<bool>()) {
+            action.set_state(&ask.to_variant());
+            Settings::load().set_ask_for_backup(ask);
+        }
+    });
+    window.add_action(&ask_backup);
+
+    let context = Context {
+        window: window.clone(),
+        navigation: navigation.clone(),
+        open_library,
+        backed_up: Rc::default(),
+    };
+
     // The volume monitor tells us when drives are mounted or unmounted.
     let monitor = gio::VolumeMonitor::get();
     let list = device_list.clone();
-    // The "Copy All" action opens an iPod's page too, so it needs these.
-    let (nav, open) = (navigation.clone(), open_library.clone());
-    let refresh = move |monitor: &gio::VolumeMonitor| {
-        show_ipods(monitor, &device_list, &stack, &navigation, &open_library);
+    let refresh = {
+        let context = context.clone();
+        move |monitor: &gio::VolumeMonitor| show_ipods(monitor, &device_list, &stack, &context)
     };
     refresh(&monitor);
 
@@ -124,16 +169,29 @@ fn build_ui(app: &adw::Application) {
     // everything on it. The target is the iPod's mount path.
     let copy_all = gio::SimpleAction::new("copy-all", Some(glib::VariantTy::STRING));
     {
-        let window = window.clone();
+        let context = context.clone();
         copy_all.connect_activate(move |_, target| {
             if let Some(mount_path) = target.and_then(|target| target.str())
-                && let Some(library) = open_ipod(Path::new(mount_path), &nav, &open, &window)
+                && let Some(library) = open_ipod(Path::new(mount_path), &context)
             {
                 library.copy_all();
             }
         });
     }
     actions.add_action(&copy_all);
+
+    // "Back Up…": the same backup that is offered when an iPod is opened, but
+    // on request. The target is the mount path and the name of the iPod.
+    let back_up = gio::SimpleAction::new("back-up", Some(&<(String, String)>::static_variant_type()));
+    {
+        let context = context.clone();
+        back_up.connect_activate(move |_, target| {
+            if let Some((mount_path, name)) = target.and_then(|target| target.get::<(String, String)>()) {
+                start_backup(&context, PathBuf::from(mount_path), name, false);
+            }
+        });
+    }
+    actions.add_action(&back_up);
 
     // `refresh` is moved into the first handler, so the others get clones.
     // A closure can be cloned when everything it captures can be cloned,
@@ -154,49 +212,91 @@ fn build_ui(app: &adw::Application) {
 }
 
 /// Opens the page of the iPod mounted at `mount_path`, or explains why that
-/// isn't possible. `parent` is the widget an error dialog belongs to.
-///
-/// `impl IsA<gtk::Widget>` means "any kind of widget": a row, a window...
-fn open_ipod(
-    mount_path: &Path,
-    navigation: &adw::NavigationView,
-    open_library: &OpenLibrary,
-    parent: &impl IsA<gtk::Widget>,
-) -> Option<Rc<Library>> {
-    match Library::new(mount_path, navigation) {
+/// isn't possible.
+fn open_ipod(mount_path: &Path, context: &Context) -> Option<Rc<Library>> {
+    match Library::new(mount_path, &context.navigation) {
         Ok(library) => {
-            navigation.push(library.page());
-            open_library.replace(Some(library.clone()));
+            context.navigation.push(library.page());
+            context.open_library.replace(Some(library.clone()));
             Some(library)
         }
         Err(error) => {
-            let dialog = adw::AlertDialog::new(Some("Can't Read the Music Database"), Some(&error.to_string()));
-            dialog.add_response("close", "Close");
-            dialog.present(Some(parent));
+            show_error(context, "Can't Read the Music Database", &error.to_string());
             None
         }
     }
 }
 
+/// A message with a Close button.
+fn show_error(context: &Context, heading: &str, message: &str) {
+    let dialog = adw::AlertDialog::new(Some(heading), Some(message));
+    dialog.add_response("close", "Close");
+    dialog.present(Some(&context.window));
+}
+
+/// What happens when an iPod is clicked in the list: first the offer of a
+/// backup (unless the person said "don't ask again", or made one just now),
+/// then the iPod opens.
+fn open_ipod_after_offer(context: &Context, mount_path: PathBuf, name: String) {
+    let no_offer = !Settings::load().ask_for_backup() || context.backed_up.borrow().contains(&mount_path);
+    // The offer says how big the backup is. If that can't be worked out there
+    // is nothing to back up either, and opening the iPod will show what's wrong.
+    let size = backup::plan(&mount_path).map(|items| items.iter().map(|item| item.size).sum::<u64>());
+    let size = match size {
+        Ok(size) if !no_offer => size,
+        _ => {
+            open_ipod(&mount_path, context);
+            return;
+        }
+    };
+
+    let body = format!(
+        "Oxipod changes the iPod's song database, a format Apple never documented. A backup of it \
+         is cheap insurance. It holds the song list and the covers ({}), not the music.",
+        glib::format_size(size)
+    );
+    let dialog = adw::AlertDialog::new(Some("Back Up Your iPod First?"), Some(&body));
+    let dont_ask = gtk::CheckButton::builder().label("Don't ask again").halign(gtk::Align::Center).build();
+    dialog.set_extra_child(Some(&dont_ask));
+    dialog.add_responses(&[("skip", "Not Now"), ("backup", "Back Up…")]);
+    dialog.set_response_appearance("backup", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("backup"));
+    // Closing the dialog (Esc) is the same as "Not Now": it's a reminder, not a gate.
+    dialog.set_close_response("skip");
+
+    let context_for_response = context.clone();
+    dialog.connect_response(None, move |_, response| {
+        let context = &context_for_response;
+        if dont_ask.is_active()
+            && let Some(action) = context.window.lookup_action("ask-backup")
+        {
+            // Changing the state of the main menu's switch also saves it.
+            action.change_state(&false.to_variant());
+        }
+        match response {
+            "backup" => start_backup(context, mount_path.clone(), name.clone(), true),
+            _ => {
+                open_ipod(&mount_path, context);
+            }
+        }
+    });
+    dialog.present(Some(&context.window));
+}
+
 /// Rebuilds the device list and switches between the list and the empty page.
-fn show_ipods(
-    monitor: &gio::VolumeMonitor,
-    list: &gtk::ListBox,
-    stack: &gtk::Stack,
-    navigation: &adw::NavigationView,
-    open_library: &OpenLibrary,
-) {
+fn show_ipods(monitor: &gio::VolumeMonitor, list: &gtk::ListBox, stack: &gtk::Stack, context: &Context) {
     let ipods = device::find_ipods(monitor);
 
     // The open iPod was unplugged or ejected: go back to the device list.
     // The borrow ends with this statement, before pop_to_tag runs the popped
     // handler that borrows `open_library` again.
-    let unplugged = open_library
+    let unplugged = context
+        .open_library
         .borrow()
         .as_ref()
         .is_some_and(|library| !ipods.iter().any(|ipod| ipod.mount_path == library.mount_path()));
     if unplugged {
-        navigation.pop_to_tag("root");
+        context.navigation.pop_to_tag("root");
     }
 
     list.remove_all();
@@ -220,12 +320,15 @@ fn show_ipods(
         // Settings for this iPod. Clicking the button doesn't open the iPod:
         // a MenuButton keeps its clicks to itself.
         let menu = gio::Menu::new();
+        let target = (ipod.mount_path.to_string_lossy().into_owned(), ipod.name.clone()).to_variant();
+        let back_up = gio::MenuItem::new(Some("Back Up…"), None);
+        back_up.set_action_and_target_value(Some("device.back-up"), Some(&target));
+        menu.append_item(&back_up);
         let copy_all = gio::MenuItem::new(Some("Copy All to Computer…"), None);
         let path_target = ipod.mount_path.to_string_lossy().to_variant();
         copy_all.set_action_and_target_value(Some("device.copy-all"), Some(&path_target));
         menu.append_item(&copy_all);
         let rename = gio::MenuItem::new(Some("Rename…"), None);
-        let target = (ipod.mount_path.to_string_lossy().into_owned(), ipod.name.clone()).to_variant();
         rename.set_action_and_target_value(Some("device.rename"), Some(&target));
         menu.append_item(&rename);
         let menu_button = gtk::MenuButton::builder()
@@ -239,16 +342,161 @@ fn show_ipods(
         row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
 
         // Each closure needs its own copies of what it uses.
-        let mount_path = ipod.mount_path.clone();
-        let navigation = navigation.clone();
-        let open_library = open_library.clone();
-        row.connect_activated(move |row| {
-            open_ipod(&mount_path, &navigation, &open_library, row);
-        });
+        let (mount_path, name, context) = (ipod.mount_path.clone(), ipod.name.clone(), context.clone());
+        row.connect_activated(move |_| open_ipod_after_offer(&context, mount_path.clone(), name.clone()));
         list.append(&row);
     }
 
     stack.set_visible_child_name(if ipods.is_empty() { "empty" } else { "devices" });
+}
+
+/// How a backup ended.
+enum BackupResult {
+    Done(backup::Done),
+    /// The person changed their mind: closed the folder chooser, or pressed Cancel.
+    Cancelled,
+    Failed(String),
+}
+
+/// Asks where to save a backup of the iPod, makes it, and says how it went.
+/// With `open_after` the iPod opens afterwards: the backup was offered
+/// because the person was opening the iPod.
+fn start_backup(context: &Context, mount_path: PathBuf, name: String, open_after: bool) {
+    let context = context.clone();
+    // A backup takes a while. This future keeps GTK responsive while it waits,
+    // like renaming does.
+    glib::spawn_future_local(async move {
+        match make_backup(&context, &mount_path, &name).await {
+            BackupResult::Done(done) => {
+                context.backed_up.borrow_mut().insert(mount_path.clone());
+                show_backup_done(&context, mount_path, done, open_after);
+            }
+            BackupResult::Cancelled => {}
+            BackupResult::Failed(message) => show_error(&context, "Couldn't Back Up the iPod", &message),
+        }
+    });
+}
+
+async fn make_backup(context: &Context, mount_path: &Path, name: &str) -> BackupResult {
+    let items = match backup::plan(mount_path) {
+        Ok(items) => items,
+        Err(error) => return BackupResult::Failed(error.to_string()),
+    };
+    let total: u64 = items.iter().map(|item| item.size).sum();
+
+    // Where to put it. The backup gets a folder of its own inside the one chosen.
+    let chooser = gtk::FileDialog::builder().title("Choose Where to Save the Backup").accept_label("Back Up").build();
+    if let Some(documents) = glib::user_special_dir(glib::UserDirectory::Documents) {
+        chooser.set_initial_folder(Some(&gio::File::for_path(documents)));
+    }
+    // An error here means the chooser was closed without choosing.
+    let Ok(folder) = chooser.select_folder_future(Some(&context.window)).await else {
+        return BackupResult::Cancelled;
+    };
+    let Some(destination) = folder.path() else {
+        return BackupResult::Failed("That folder can't be used".into());
+    };
+    if let Some(free) = device::free_space(&destination)
+        && free < total
+    {
+        return BackupResult::Failed(format!(
+            "Not enough room there: the backup needs {}, the folder has {} free",
+            glib::format_size(total),
+            glib::format_size(free)
+        ));
+    }
+
+    let now = glib::DateTime::now_local().ok();
+    let when = |format: &str| now.as_ref().and_then(|now| now.format(format).ok()).map(String::from).unwrap_or_default();
+    let folder_name = backup::folder_name(name, &when("%Y-%m-%d %H%M"));
+    let note = backup::note(name, &when("%-d %B %Y, %H:%M"));
+
+    // The progress window. It can't be closed until the backup is over, but it
+    // has a Cancel button.
+    let bar = gtk::ProgressBar::builder().show_text(true).build();
+    let cancel_button = gtk::Button::builder().label("Cancel").halign(gtk::Align::Center).build();
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(18).build();
+    content.append(&bar);
+    content.append(&cancel_button);
+    let dialog = adw::AlertDialog::new(Some("Backing Up…"), Some("Keep the iPod plugged in until this is done."));
+    dialog.set_extra_child(Some(&content));
+    dialog.set_can_close(false);
+
+    // The thread that copies and this code both look at these. An `Arc` is
+    // like an `Rc` that may be shared with another thread, and the atomic
+    // types can be changed from several threads at once.
+    let copied = Arc::new(AtomicU64::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let cancel = cancel.clone();
+        cancel_button.connect_clicked(move |button| {
+            cancel.store(true, Ordering::Relaxed);
+            button.set_sensitive(false);
+        });
+    }
+    dialog.present(Some(&context.window));
+
+    // Keeps the bar up to date, ten times a second, until the copying is over.
+    let finished = Rc::new(Cell::new(false));
+    glib::spawn_future_local({
+        let (copied, finished) = (copied.clone(), finished.clone());
+        async move {
+            while !finished.get() {
+                let done = copied.load(Ordering::Relaxed);
+                bar.set_fraction(if total > 0 { done as f64 / total as f64 } else { 0.0 });
+                bar.set_text(Some(&format!("{} of {}", glib::format_size(done), glib::format_size(total))));
+                glib::timeout_future(Duration::from_millis(100)).await;
+            }
+        }
+    });
+
+    // Everything the thread uses is moved into it.
+    let (ipod, thread_copied, thread_cancel) = (mount_path.to_path_buf(), copied.clone(), cancel.clone());
+    let result = gio::spawn_blocking(move || {
+        backup::back_up(&ipod, &items, &destination, &folder_name, &note, &thread_copied, &thread_cancel)
+    })
+    .await;
+    finished.set(true);
+    dialog.set_can_close(true);
+    dialog.force_close();
+
+    match result {
+        Ok(Ok(done)) => BackupResult::Done(done),
+        Ok(Err(_)) if cancel.load(Ordering::Relaxed) => BackupResult::Cancelled,
+        Ok(Err(error)) => BackupResult::Failed(error.to_string()),
+        Err(_) => BackupResult::Failed("the backup crashed".into()),
+    }
+}
+
+/// Says where the backup is. With `open_after`, the iPod opens when the
+/// message is closed.
+fn show_backup_done(context: &Context, mount_path: PathBuf, done: backup::Done, open_after: bool) {
+    let folder_name = done.folder.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let files = if done.files == 1 { "1 file".to_string() } else { format!("{} files", done.files) };
+    let body = format!("{files} ({}) saved in the folder “{folder_name}”.", glib::format_size(done.bytes));
+    let dialog = adw::AlertDialog::new(Some("Backup Done"), Some(&body));
+    dialog.add_responses(&[("show", "Show Files"), ("continue", if open_after { "Open iPod" } else { "Close" })]);
+    dialog.set_response_appearance("continue", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("continue"));
+    dialog.set_close_response("continue");
+
+    let context_for_response = context.clone();
+    dialog.connect_response(None, move |_, response| {
+        let context = &context_for_response;
+        if response == "show" {
+            let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&done.folder)));
+            let window = context.window.clone();
+            glib::spawn_future_local(async move {
+                if let Err(error) = launcher.open_containing_folder_future(Some(&window)).await {
+                    eprintln!("Couldn't show the folder: {error}");
+                }
+            });
+        }
+        if open_after {
+            open_ipod(&mount_path, context);
+        }
+    });
+    dialog.present(Some(&context.window));
 }
 
 /// Asks for a new name for an iPod and renames it. `reload` rebuilds the

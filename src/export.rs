@@ -101,7 +101,7 @@ pub fn file_name(artist: Option<&str>, title: Option<&str>, extension: &str) -> 
 }
 
 /// Makes a piece of text safe to use in a file name.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     // Characters that Windows and FAT drives refuse (and "/", which Linux
     // refuses) become an underscore, so the files also copy to a USB stick.
     // Any kind of white space (a new line, a tab) becomes a plain space.
@@ -123,7 +123,7 @@ fn clean(text: &str) -> String {
 
 /// Cuts `text` to at most `max` bytes, without cutting a character in half:
 /// an "é" is two bytes, a Japanese character three.
-fn shorten(text: &str, max: usize) -> String {
+pub(crate) fn shorten(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }

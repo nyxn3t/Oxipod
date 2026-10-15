@@ -13,6 +13,7 @@ use gtk::{gdk, gio, glib};
 
 use crate::convert;
 use crate::covers;
+use crate::device;
 use crate::eject;
 use crate::export::{self, Layout, Outcome};
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
@@ -1379,7 +1380,7 @@ impl Library {
 
         // Check the room before starting: the folder may be on a small drive.
         let needed: u64 = jobs.iter().filter_map(|job| std::fs::metadata(&job.source).ok()).map(|file| file.len()).sum();
-        if let Some(free) = free_space_at(&folder)
+        if let Some(free) = device::free_space(&folder)
             && free < needed
         {
             self.toast(&format!(
@@ -1478,7 +1479,7 @@ impl Library {
 
     /// Free space on the iPod in bytes, if it can be read.
     fn free_space(&self) -> Option<u64> {
-        free_space_at(&self.mount_path)
+        device::free_space(&self.mount_path)
     }
 
     /// Shows the banner if the iPod has song files the database doesn't know.
@@ -1844,14 +1845,6 @@ fn with_test_songs(mut tracks: Vec<Track>) -> Vec<Track> {
         ..Default::default()
     }));
     tracks
-}
-
-/// Free space on the drive that `path` is on, in bytes, if it can be read.
-fn free_space_at(path: &Path) -> Option<u64> {
-    let info = gio::File::for_path(path)
-        .query_filesystem_info(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE, gio::Cancellable::NONE)
-        .ok()?;
-    Some(info.attribute_uint64(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE))
 }
 
 fn files_count(count: usize) -> String {
