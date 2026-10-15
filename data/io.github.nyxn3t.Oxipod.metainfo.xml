@@ -23,12 +23,14 @@
       <li>Copies cover art from the file or from a cover image in the album folder, or lets you pick one yourself</li>
       <li>Search the songs and sort them by title, artist, album or date added</li>
       <li>Finds songs that are on the iPod twice, so you can delete the extra copies</li>
-      <li>Create playlists and add or remove songs</li>
+      <li>Create playlists, add or remove songs, and pick several songs on a playlist's page</li>
+      <li>Fix the title, artist, album and album artist of one song or of several at once</li>
       <li>Delete songs from the iPod, one at a time or several at once</li>
       <li>Copy songs back to your computer, in folders by artist and album if you like</li>
-      <li>Offers to back up the iPod's database before you open it</li>
+      <li>Offers to back up the iPod's database before you open it, and puts a backup back if something goes wrong</li>
       <li>Sets newer iPods up by itself the first time you open them</li>
-      <li>Finds and cleans up leftover files from interrupted syncs</li>
+      <li>Finds and cleans up leftover files from interrupted syncs, and songs whose files are gone</li>
+      <li>Tells you when an iPod can't be changed, like one that was formatted on a Mac, and says why</li>
     </ul>
     <p>
       Oxipod is built on libgpod, so it should work with the iPods libgpod
@@ -41,11 +43,11 @@
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.6.0/data/screenshots/songs.png</image>
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.7.0/data/screenshots/songs.png</image>
       <caption>The songs on an iPod nano</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.6.0/data/screenshots/search.png</image>
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.7.0/data/screenshots/search.png</image>
       <caption>Searching the songs</caption>
     </screenshot>
   </screenshots>
@@ -75,6 +77,19 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.7.0" date="2026-10-15">
+      <description>
+        <p>Edit tags, pick songs on playlists, and put a backup back.</p>
+        <ul>
+          <li>Edit the title, artist, album and album artist of a song, or of several songs at once. This changes what the iPod shows, not your files</li>
+          <li>Tick several songs on a playlist's page to take them off it or copy them in one go</li>
+          <li>Restore from Backup puts a backup back on the iPod. Oxipod checks that it is from this iPod and saves what is on the iPod now first, so you can undo it</li>
+          <li>Songs that are in the list but whose files are gone get a banner, with a button to take them out of the list</li>
+          <li>An iPod that is mounted read-only, like one formatted on a Mac, shows a lock and a banner that says why, and everything that would change it is switched off</li>
+          <li>New screenshots</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-10-15">
       <description>
         <p>Newer iPods set themselves up.</p>
