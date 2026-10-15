@@ -30,7 +30,7 @@ pub type PlaylistId = u64;
 pub struct Error(String);
 
 impl Error {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Error(message.into())
     }
 }
@@ -172,6 +172,25 @@ impl Database {
             }
             string_from_c((*master).name)
         }
+    }
+
+    /// Renames the iPod. This is the name iTunes shows, and the one the iPod
+    /// shows under Settings > About. It's stored as the name of the master
+    /// playlist, the playlist that holds every song. The new name reaches the
+    /// iPod with the next `save`.
+    pub fn set_name(&mut self, name: &str) -> Result<(), Error> {
+        // SAFETY: the master playlist is owned by the database. Its old name
+        // was allocated by glib, so it is freed with g_free, and the new one
+        // is made with g_strdup (glib_string) for the same reason.
+        unsafe {
+            let master = ffi::itdb_playlist_mpl(self.raw());
+            if master.is_null() {
+                return Err(Error::new("the database has no master playlist"));
+            }
+            ffi::g_free((*master).name.cast());
+            (*master).name = glib_string(Some(name));
+        }
+        Ok(())
     }
 
     /// The model libgpod detected for this iPod.
@@ -693,6 +712,32 @@ mod tests {
         let with_cover = tracks.iter().filter(|track| db.cover(track.id, 64).is_some()).count();
         println!("{with_cover} tracks have cover art");
         assert!(!tracks.is_empty());
+    }
+
+    // Renames the iPod, checks the new name after reopening the database, and
+    // puts the old name back. Run with OXIPOD_TEST_IPOD set.
+    #[test]
+    #[ignore = "writes to a mounted iPod"]
+    fn renames_an_ipod_and_back() {
+        let mount = std::env::var("OXIPOD_TEST_IPOD").expect("OXIPOD_TEST_IPOD is not set");
+        let path = Path::new(&mount);
+        let mut db = Database::open(path).expect("could not open the database");
+        let original = db.name().expect("the iPod has a name");
+        let tracks = db.tracks().len();
+
+        db.set_name("Oxipod rename test").unwrap();
+        db.save().unwrap();
+        drop(db);
+        let mut db = Database::open(path).expect("could not reopen the database");
+        assert_eq!(db.name().as_deref(), Some("Oxipod rename test"));
+        assert_eq!(db.tracks().len(), tracks);
+
+        db.set_name(&original).unwrap();
+        db.save().unwrap();
+        drop(db);
+        let db = Database::open(path).expect("could not reopen the database");
+        assert_eq!(db.name().as_deref(), Some(original.as_str()));
+        assert_eq!(db.tracks().len(), tracks);
     }
 
     // Adds a song and a playlist, saves, reopens, then removes both again.

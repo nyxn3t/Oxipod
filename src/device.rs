@@ -1,4 +1,4 @@
-//! Finding iPods among the drives the desktop has mounted.
+//! Finding iPods among the drives the desktop has mounted, and renaming them.
 
 use std::path::PathBuf;
 
@@ -58,4 +58,21 @@ fn disk_space(root: &gio::File) -> Result<(u64, u64), gtk::glib::Error> {
         info.attribute_uint64(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE),
         info.attribute_uint64(gio::FILE_ATTRIBUTE_FILESYSTEM_SIZE),
     ))
+}
+
+/// Gives the iPod mounted at `mount_path` a new name.
+///
+/// The database is opened, changed and saved on a background thread: saving
+/// takes a second or two because the iPod is a slow USB drive. A `Database`
+/// can't be passed between threads, so all of it happens inside the closure
+/// and only the result comes back.
+pub async fn rename(mount_path: PathBuf, new_name: String) -> Result<(), gpod::Error> {
+    let done = gio::spawn_blocking(move || {
+        let mut db = gpod::Database::open(&mount_path)?;
+        db.set_name(&new_name)?;
+        db.save()
+    })
+    .await;
+    // The outer Result is only an Err if the thread panicked.
+    done.unwrap_or_else(|_| Err(gpod::Error::new("the rename crashed")))
 }
