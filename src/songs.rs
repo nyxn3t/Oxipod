@@ -1,4 +1,4 @@
-//! The song list on the Songs tab.
+//! The song list on the Songs tab, with search and sorting.
 //!
 //! Showing thousands of songs with one widget per song would be slow, so this
 //! uses a `gtk::ListView`. It only builds widgets for the rows you can see and
@@ -9,6 +9,7 @@
 //! ```text
 //!   ListView          draws the rows
 //!   NoSelection       (GTK's own selection is off, the songs know if they're ticked)
+//!   FilterListModel   hides the songs that don't match the search
 //!   SortListModel     puts the songs in order
 //!   ListStore         every song on the iPod
 //! ```
@@ -25,31 +26,106 @@ use gtk::{gdk, gio, glib};
 use crate::gpod::{Track, TrackId};
 use crate::library::{COVER_SIZE, format_duration};
 
-/// A song, plus its lowercase title, which sorting compares.
+/// A song, plus the lowercase text that searching and sorting compare.
 ///
-/// The lowercase text is made once, here, instead of on every comparison:
-/// sorting a few thousand songs compares them tens of thousands of times.
+/// That text is made once, here, instead of on every comparison: sorting a
+/// few thousand songs compares them tens of thousands of times.
 pub struct Song {
     pub track: Track,
+    /// Title, artist and album in one lowercase string, for the search.
+    haystack: String,
     title_key: String,
+    artist_key: String,
+    album_key: String,
 }
 
 impl Song {
     fn new(track: Track) -> Self {
-        // "No title" becomes "", which sorts first.
-        let title_key = track.title.as_deref().unwrap_or_default().to_lowercase();
-        Song { track, title_key }
+        // A closure that lowercases an optional text; "no text" becomes "".
+        let lower = |text: &Option<String>| text.as_deref().unwrap_or_default().to_lowercase();
+        let title_key = lower(&track.title);
+        let artist_key = lower(&track.artist);
+        let album_key = lower(&track.album);
+        let haystack = format!("{title_key} {artist_key} {album_key}");
+        Song { track, haystack, title_key, artist_key, album_key }
     }
 
-    /// Which of two songs comes first: by title, ignoring case, like the iPod
-    /// does.
+    /// Whether every word of the search is somewhere in the title, artist or
+    /// album. "lorna pain" finds "Pain Remains" by "Lorna Shore".
+    fn matches(&self, words: &[String]) -> bool {
+        words.iter().all(|word| self.haystack.contains(word.as_str()))
+    }
+
+    /// Where the song sits on its album: by disc, then by track number. Songs
+    /// that don't say come last.
+    fn position(&self) -> (i32, i32) {
+        let track = if self.track.track_number > 0 { self.track.track_number } else { i32::MAX };
+        (self.track.disc_number.max(1), track)
+    }
+
+    /// Which of two songs comes first when sorting by `mode`.
     ///
     /// `Ordering` is `Less`, `Equal` or `Greater`. `then_with` only looks at the
-    /// next rule when the earlier one said `Equal`. The last rule (the id) is
-    /// different for every song, so two songs are never really equal and the
-    /// order doesn't jump around.
-    fn compare(&self, other: &Song) -> Ordering {
-        self.title_key.cmp(&other.title_key).then_with(|| self.track.id.cmp(&other.track.id))
+    /// next rule when the earlier ones said `Equal`, which is how "by artist,
+    /// then by album, then by track number" is written. The last rule (the id)
+    /// is different for every song, so two songs are never really equal and
+    /// the order doesn't jump around.
+    fn compare(&self, other: &Song, mode: SortMode) -> Ordering {
+        let by_title = || self.title_key.cmp(&other.title_key);
+        let by_artist = || unknown_last(&self.artist_key, &other.artist_key);
+        let by_album = || unknown_last(&self.album_key, &other.album_key);
+        let by_position = || self.position().cmp(&other.position());
+        match mode {
+            SortMode::Title => by_title().then_with(by_artist),
+            SortMode::Artist => by_artist().then_with(by_album).then_with(by_position).then_with(by_title),
+            SortMode::Album => by_album().then_with(by_artist).then_with(by_position).then_with(by_title),
+            // Newest first: note `other` on the left.
+            SortMode::Added => other.track.added.cmp(&self.track.added).then_with(by_title),
+        }
+        .then_with(|| self.track.id.cmp(&other.track.id))
+    }
+}
+
+/// Compares two names, with the empty one (unknown artist or album) last.
+fn unknown_last(a: &str, b: &str) -> Ordering {
+    // `false` sorts before `true`, so a name that isn't empty comes first.
+    a.is_empty().cmp(&b.is_empty()).then_with(|| a.cmp(b))
+}
+
+/// What the song list is sorted by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortMode {
+    #[default]
+    Title,
+    Artist,
+    Album,
+    Added,
+}
+
+impl SortMode {
+    pub const ALL: [SortMode; 4] = [SortMode::Title, SortMode::Artist, SortMode::Album, SortMode::Added];
+
+    /// The name used for the menu action's value.
+    pub fn id(self) -> &'static str {
+        match self {
+            SortMode::Title => "title",
+            SortMode::Artist => "artist",
+            SortMode::Album => "album",
+            SortMode::Added => "added",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<SortMode> {
+        SortMode::ALL.into_iter().find(|mode| mode.id() == id)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Title => "Title",
+            SortMode::Artist => "Artist",
+            SortMode::Album => "Album",
+            SortMode::Added => "Recently Added",
+        }
     }
 }
 
@@ -151,17 +227,28 @@ impl Notifier {
     }
 }
 
-/// How many songs there are, how long they play, and how many are ticked.
+/// How many songs there are, which are shown, and which are ticked.
 pub struct Stats {
     pub total: usize,
-    pub length: Duration,
+    pub shown: usize,
+    /// Playing time of the songs that are shown.
+    pub shown_length: Duration,
+    /// Ticked songs, including those the search hides.
     pub selected: usize,
+    pub shown_selected: usize,
 }
 
 pub struct SongList {
     store: gio::ListStore,
     sorted: gtk::SortListModel,
+    filtered: gtk::FilterListModel,
+    sorter: gtk::CustomSorter,
+    filter: gtk::CustomFilter,
     scroller: gtk::ScrolledWindow,
+    /// Shared with the sorter, which reads it for every comparison.
+    sort_mode: Rc<Cell<SortMode>>,
+    /// The search, split into lowercase words. Shared with the filter.
+    words: Rc<RefCell<Vec<String>>>,
     selection_changed: Rc<Notifier>,
     shown_changed: Rc<Notifier>,
 }
@@ -175,17 +262,34 @@ impl SongList {
         load_cover: impl Fn(TrackId) -> Option<gdk::Texture> + 'static,
         song_menu: impl Fn(TrackId) -> gio::Menu + 'static,
     ) -> Self {
+        let sort_mode = Rc::new(Cell::new(SortMode::default()));
+        let words: Rc<RefCell<Vec<String>>> = Rc::default();
+
         let store = gio::ListStore::new::<SongObject>();
 
-        let sorter = gtk::CustomSorter::new(|a, b| {
-            // The model only ever holds SongObjects, so these can't fail.
-            let a = a.downcast_ref::<SongObject>().expect("a SongObject");
-            let b = b.downcast_ref::<SongObject>().expect("a SongObject");
-            a.song().compare(b.song()).into()
+        // `move` hands the closure its own copy of `sort_mode` (the Rc is
+        // cloned first, so both the list and the sorter keep one).
+        let sorter = gtk::CustomSorter::new({
+            let sort_mode = sort_mode.clone();
+            move |a, b| {
+                // The model only ever holds SongObjects, so these can't fail.
+                let a = a.downcast_ref::<SongObject>().expect("a SongObject");
+                let b = b.downcast_ref::<SongObject>().expect("a SongObject");
+                a.song().compare(b.song(), sort_mode.get()).into()
+            }
         });
-        let sorted = gtk::SortListModel::new(Some(store.clone()), Some(sorter));
+        let sorted = gtk::SortListModel::new(Some(store.clone()), Some(sorter.clone()));
 
-        let selection = gtk::NoSelection::new(Some(sorted.clone()));
+        let filter = gtk::CustomFilter::new({
+            let words = words.clone();
+            move |item| {
+                let song = item.downcast_ref::<SongObject>().expect("a SongObject");
+                song.song().matches(&words.borrow())
+            }
+        });
+        let filtered = gtk::FilterListModel::new(Some(sorted.clone()), Some(filter.clone()));
+
+        let selection = gtk::NoSelection::new(Some(filtered.clone()));
         let factory = row_factory(select_button, Rc::new(load_cover), Rc::new(song_menu));
         let view = gtk::ListView::builder()
             .model(&selection)
@@ -213,9 +317,20 @@ impl SongList {
 
         let shown_changed = Rc::new(Notifier::default());
         let notifier = shown_changed.clone();
-        sorted.connect_items_changed(move |_, _, _, _| notifier.poke());
+        filtered.connect_items_changed(move |_, _, _, _| notifier.poke());
 
-        SongList { store, sorted, scroller, selection_changed: Rc::default(), shown_changed }
+        SongList {
+            store,
+            sorted,
+            filtered,
+            sorter,
+            filter,
+            scroller,
+            sort_mode,
+            words,
+            selection_changed: Rc::default(),
+            shown_changed,
+        }
     }
 
     pub fn widget(&self) -> &gtk::ScrolledWindow {
@@ -227,7 +342,8 @@ impl SongList {
         self.selection_changed.set(f);
     }
 
-    /// `f` runs (a moment after the last change) when songs are added or deleted.
+    /// `f` runs (a moment after the last change) when the shown songs change:
+    /// songs added or deleted, a new search.
     pub fn connect_shown_changed(&self, f: impl Fn() + 'static) {
         self.shown_changed.set(f);
     }
@@ -266,28 +382,63 @@ impl SongList {
         self.store.extend_from_slice(&new_songs);
     }
 
+    pub fn set_sort(&self, mode: SortMode) {
+        self.sort_mode.set(mode);
+        // Tell the sorter its rules changed, so the list sorts itself again.
+        self.sorter.changed(gtk::SorterChange::Different);
+    }
+
+    /// Shows only the songs that match `query` (all of them when it's empty).
+    pub fn set_query(&self, query: &str) {
+        let new: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let old = self.words.replace(new.clone());
+        if old == new {
+            return;
+        }
+        // Telling the filter how it changed lets it skip work: if the new
+        // search can only match a subset of what the old one matched, only the
+        // songs shown now need checking again (and the other way around).
+        let change = if narrower(&old, &new) {
+            gtk::FilterChange::MoreStrict
+        } else if narrower(&new, &old) {
+            gtk::FilterChange::LessStrict
+        } else {
+            gtk::FilterChange::Different
+        };
+        self.filter.changed(change);
+    }
+
     pub fn stats(&self) -> Stats {
-        let mut stats = Stats { total: self.store.n_items() as usize, length: Duration::ZERO, selected: 0 };
+        let mut stats = Stats {
+            total: self.store.n_items() as usize,
+            shown: self.filtered.n_items() as usize,
+            shown_length: Duration::ZERO,
+            selected: 0,
+            shown_selected: 0,
+        };
         for song in songs_in(&self.store) {
-            stats.length += song.song().track.length;
             stats.selected += usize::from(song.selected());
+        }
+        for song in songs_in(&self.filtered) {
+            stats.shown_length += song.song().track.length;
+            stats.shown_selected += usize::from(song.selected());
         }
         stats
     }
 
-    /// The ticked songs, in the order the list shows them.
+    /// The ticked songs (also the ones a search hides), in the order the list shows them.
     pub fn selected_ids(&self) -> Vec<TrackId> {
         songs_in(&self.sorted).filter(|song| song.selected()).map(|song| song.id()).collect()
     }
 
-    /// Ticks or unticks every song.
-    pub fn select_all(&self, on: bool) {
-        for song in songs_in(&self.sorted) {
+    /// Ticks or unticks the songs that are shown. Hidden ones stay as they are.
+    pub fn select_shown(&self, on: bool) {
+        for song in songs_in(&self.filtered) {
             song.set_selected(on);
         }
     }
 
-    /// Unticks every song.
+    /// Unticks every song, hidden or not.
     pub fn clear_selection(&self) {
         for song in songs_in(&self.store) {
             song.set_selected(false);
@@ -297,13 +448,19 @@ impl SongList {
 
 /// Every song in a model, in the model's order.
 ///
-/// `gio`'s own `iter::<SongObject>()` can't be used on the sort model: it
-/// says it holds plain `Object`s, and `iter` refuses to cast. So this asks
-/// for each item and checks its type itself. `impl Iterator` means "some
+/// `gio`'s own `iter::<SongObject>()` can't be used on the sort and filter
+/// models: they say they hold plain `Object`s, and it refuses to cast. So this
+/// asks for each item and checks its type itself. `impl Iterator` means "some
 /// iterator that gives `SongObject`s": the caller can use it in a `for` loop
 /// without knowing the exact type, and nothing is collected into a Vec first.
 fn songs_in(model: &impl IsA<gio::ListModel>) -> impl Iterator<Item = SongObject> + '_ {
     (0..model.n_items()).filter_map(|position| model.item(position).and_downcast::<SongObject>())
+}
+
+/// Whether every word of `old` is part of some word of `new`. Then a song that
+/// matches `new` is sure to match `old` too: `new` is the stricter search.
+fn narrower(old: &[String], new: &[String]) -> bool {
+    old.iter().all(|word| new.iter().any(|other| other.contains(word.as_str())))
 }
 
 /// What a row is currently connected to. Dropping it disconnects the row from
@@ -473,32 +630,82 @@ fn request_cover(song: &SongObject, load_cover: &CoverLoader) {
 mod tests {
     use super::*;
 
-    fn song(id: u64, title: &str) -> Song {
+    fn song(id: u64, title: &str, artist: &str, album: &str, disc: i32, track: i32, added: u64) -> Song {
+        let text = |text: &str| (!text.is_empty()).then(|| text.to_string());
         Song::new(Track {
             id,
-            title: (!title.is_empty()).then(|| title.to_string()),
-            artist: None,
-            album: None,
+            title: text(title),
+            artist: text(artist),
+            album: text(album),
             length: Duration::from_secs(180),
+            track_number: track,
+            disc_number: disc,
+            added,
         })
     }
 
-    /// Sorts the songs and returns their ids.
-    fn order(songs: &mut [Song]) -> Vec<u64> {
-        songs.sort_by(|a, b| a.compare(b));
+    /// Sorts the songs by `mode` and returns their ids.
+    fn order(songs: &mut [Song], mode: SortMode) -> Vec<u64> {
+        songs.sort_by(|a, b| a.compare(b, mode));
         songs.iter().map(|song| song.track.id).collect()
     }
 
     #[test]
+    fn search_needs_every_word_but_in_any_field() {
+        let song = song(1, "Pain Remains I", "Lorna Shore", "Pain Remains", 1, 1, 0);
+        let words = |query: &str| query.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>();
+        assert!(song.matches(&words("")));
+        assert!(song.matches(&words("lorna pain")));
+        assert!(song.matches(&words("SHORE remains")));
+        assert!(!song.matches(&words("lorna metallica")));
+    }
+
+    #[test]
     fn sorts_by_title_ignoring_case() {
-        let mut songs = [song(1, "banana"), song(2, "Apple"), song(3, "cherry"), song(4, "")];
-        assert_eq!(order(&mut songs), [4, 2, 1, 3]);
+        let mut songs = [
+            song(1, "banana", "", "", 0, 0, 0),
+            song(2, "Apple", "", "", 0, 0, 0),
+            song(3, "cherry", "", "", 0, 0, 0),
+        ];
+        assert_eq!(order(&mut songs, SortMode::Title), [2, 1, 3]);
+    }
+
+    #[test]
+    fn sorts_by_artist_then_album_then_track_with_unknown_last() {
+        let mut songs = [
+            song(1, "No Artist", "", "", 0, 0, 0),
+            song(2, "B side", "Zed", "Second", 1, 1, 0),
+            song(3, "Track two", "Abe", "Debut", 1, 2, 0),
+            song(4, "Track one", "Abe", "Debut", 1, 1, 0),
+            song(5, "Other disc", "Abe", "Debut", 2, 1, 0),
+        ];
+        assert_eq!(order(&mut songs, SortMode::Artist), [4, 3, 5, 2, 1]);
+    }
+
+    #[test]
+    fn newest_songs_come_first() {
+        let mut songs = [
+            song(1, "old", "", "", 0, 0, 100),
+            song(2, "new", "", "", 0, 0, 300),
+            song(3, "middle", "", "", 0, 0, 200),
+        ];
+        assert_eq!(order(&mut songs, SortMode::Added), [2, 3, 1]);
     }
 
     #[test]
     fn songs_that_look_the_same_keep_a_steady_order() {
-        let mut songs = [song(9, "same"), song(3, "same")];
-        assert_eq!(order(&mut songs), [3, 9]);
+        let mut songs = [song(9, "same", "", "", 0, 0, 0), song(3, "same", "", "", 0, 0, 0)];
+        assert_eq!(order(&mut songs, SortMode::Title), [3, 9]);
+    }
+
+    #[test]
+    fn knows_when_a_search_became_stricter() {
+        let words = |query: &str| query.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>();
+        assert!(narrower(&words("lorna"), &words("lorna shore"))); // another word
+        assert!(narrower(&words("lor"), &words("lorna"))); // a longer word
+        assert!(narrower(&words(""), &words("anything"))); // from nothing
+        assert!(!narrower(&words("lorna shore"), &words("lorna")));
+        assert!(!narrower(&words("lorna"), &words("shore")));
     }
 
     /// How many widgets of one GTK type there are inside `widget`.
@@ -512,10 +719,10 @@ mod tests {
         count
     }
 
-    /// The whole list with 20,000 songs, in a real window. GTK needs a display
-    /// and can only be started once per program, so this is one test; run it
-    /// with `cargo test -- --ignored --nocapture`. A window flashes up for a
-    /// second or two.
+    /// The whole list with 20,000 songs: the models, and the rows in a real
+    /// window. GTK needs a display and can only be started once per program,
+    /// so this is one test; run it with `cargo test -- --ignored --nocapture`.
+    /// A window flashes up for a second or two.
     #[test]
     #[ignore = "needs a display and opens a window"]
     fn handles_20000_songs() {
@@ -531,15 +738,31 @@ mod tests {
                 artist: Some(format!("Artist {}", n % 97)),
                 album: Some(format!("Album {}", n % 389)),
                 length: Duration::from_secs(200),
+                track_number: (n % 12) as i32 + 1,
+                disc_number: 1,
+                added: n,
             })
             .collect();
 
         let start = Instant::now();
         list.set_tracks(&tracks);
         println!("adding 20000 songs and sorting them by title: {:?}", start.elapsed());
-        assert_eq!(list.stats().total, 20_000);
-        let first = list.sorted.item(0).and_downcast::<SongObject>().unwrap();
-        assert_eq!(first.song().track.title.as_deref(), Some("Song 00000"));
+        assert_eq!(list.stats().shown, 20_000);
+
+        for mode in SortMode::ALL {
+            let start = Instant::now();
+            list.set_sort(mode);
+            let first = list.sorted.item(0).and_downcast::<SongObject>().unwrap();
+            println!("sorting by {}: {:?} (first: {:?})", mode.label(), start.elapsed(), first.song().track.title);
+        }
+        list.set_sort(SortMode::Title);
+
+        for query in ["artist 5", "artist 51", "album 17 song 0001", ""] {
+            let start = Instant::now();
+            list.set_query(query);
+            println!("search {query:?}: {:?}, {} shown", start.elapsed(), list.stats().shown);
+        }
+        assert_eq!(list.stats().shown, 20_000);
 
         // Now show it. Letting the main loop run for a moment lays the window
         // out and creates the rows, which runs the row factory for real.
@@ -559,11 +782,16 @@ mod tests {
         println!("row widgets for 20000 songs in a 500 px window: {rows}");
         assert!(rows < 300, "a fixed pool of rows, not one per song");
 
-        // Selection mode: tick everything, then untick it.
+        // Selection mode, tick everything, search, untick.
         button.set_active(true);
-        list.select_all(true);
+        list.select_shown(true);
         settle();
         assert_eq!(list.stats().selected, 20_000);
+        list.set_query("song 0001");
+        settle();
+        let stats = list.stats();
+        println!("searching 'song 0001' while everything is ticked: {} shown, {} ticked", stats.shown, stats.selected);
+        assert_eq!(stats.shown_selected, stats.shown);
         assert_eq!(list.selected_ids().len(), 20_000);
         list.clear_selection();
         settle();

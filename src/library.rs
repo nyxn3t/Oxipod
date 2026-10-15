@@ -14,7 +14,7 @@ use gtk::{gdk, gio, glib};
 use crate::convert;
 use crate::eject;
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
-use crate::songs::SongList;
+use crate::songs::{SongList, SortMode};
 
 /// Shown at this size in the song list.
 pub const COVER_SIZE: i32 = 40;
@@ -49,6 +49,9 @@ pub struct Library {
     /// Switches the bottom bar between the progress and the selection bar.
     bottom_bar: gtk::Stack,
     select_button: gtk::ToggleButton,
+    search_button: gtk::ToggleButton,
+    search_entry: gtk::SearchEntry,
+    sort_button: gtk::MenuButton,
     selection_label: gtk::Label,
     select_all_button: gtk::Button,
     selection_add_button: gtk::MenuButton,
@@ -60,7 +63,8 @@ pub struct Library {
     songs_details: gtk::Label,
     /// Switches between the song list and the "nothing here" pages.
     songs_stack: gtk::Stack,
-    /// The songs, their order and their ticks (see `songs.rs`).
+    no_results: adw::StatusPage,
+    /// The songs, their order, the search and the ticks (see `songs.rs`).
     songs: SongList,
     playlists: gtk::ListBox,
     /// The playlist page that is open, if any, so it can be refreshed.
@@ -94,8 +98,25 @@ impl Library {
             .icon_name("selection-mode-symbolic")
             .tooltip_text("Select Songs")
             .build();
+        let search_button = gtk::ToggleButton::builder()
+            .icon_name("edit-find-symbolic")
+            .tooltip_text("Search (Ctrl+F)")
+            .build();
 
-        // Above the list: how many songs and the iPod's details.
+        // The search bar slides in below the header when the search button is pressed.
+        let search_entry = gtk::SearchEntry::builder().placeholder_text("Search songs").build();
+        let search_bar = gtk::SearchBar::new();
+        search_bar.set_child(Some(&adw::Clamp::builder().maximum_size(600).child(&search_entry).build()));
+        search_bar.connect_entry(&search_entry);
+        // The button and the bar follow each other: pressing the button shows
+        // the bar, and closing the bar (Esc) un-presses the button.
+        search_button
+            .bind_property("active", &search_bar, "search-mode-enabled")
+            .bidirectional()
+            .sync_create()
+            .build();
+
+        // Above the list: how many songs, the iPod's details, and how to sort.
         let songs_title = gtk::Label::builder().xalign(0.0).css_classes(["heading"]).build();
         let songs_details = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["dim-label"]).build();
         let heading_text = gtk::Box::builder()
@@ -106,6 +127,16 @@ impl Library {
             .build();
         heading_text.append(&songs_title);
         heading_text.append(&songs_details);
+        let sort_button = gtk::MenuButton::builder()
+            .menu_model(&sort_menu())
+            .label(sort_label(SortMode::default()))
+            .always_show_arrow(true)
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        let heading = gtk::Box::builder().spacing(12).build();
+        heading.append(&heading_text);
+        heading.append(&sort_button);
 
         // The list itself is added to this stack once it exists (see below).
         let songs_stack = gtk::Stack::builder().vexpand(true).build();
@@ -114,7 +145,9 @@ impl Library {
             .title("No Songs Yet")
             .description("Drop music files here, or use the + button.")
             .build();
+        let no_results = adw::StatusPage::builder().icon_name("edit-find-symbolic").title("No Results").build();
         songs_stack.add_named(&empty_page, Some("empty"));
+        songs_stack.add_named(&no_results, Some("no-results"));
 
         let songs_column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -125,13 +158,18 @@ impl Library {
             .margin_end(12)
             .vexpand(true)
             .build();
-        songs_column.append(&heading_text);
+        songs_column.append(&heading);
         songs_column.append(&songs_stack);
-        let songs_page = adw::Clamp::builder()
-            .maximum_size(600)
-            .tightening_threshold(400)
-            .child(&songs_column)
-            .build();
+        let songs_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+        songs_page.append(&search_bar);
+        songs_page.append(
+            &adw::Clamp::builder()
+                .maximum_size(600)
+                .tightening_threshold(400)
+                .vexpand(true)
+                .child(&songs_column)
+                .build(),
+        );
 
         let playlists = boxed_list("No playlists yet");
         let new_playlist_button = gtk::Button::builder()
@@ -165,9 +203,10 @@ impl Library {
                 .build(),
         ));
         header.pack_start(&add_button);
-        // pack_end fills from the right: eject on the far right, then select.
+        // pack_end fills from the right: eject on the far right, then select, then search.
         header.pack_end(&eject_button);
         header.pack_end(&select_button);
+        header.pack_end(&search_button);
 
         // Shown at the bottom while songs are being added.
         let progress_label = gtk::Label::builder()
@@ -255,6 +294,9 @@ impl Library {
                 progress_label,
                 bottom_bar,
                 select_button,
+                search_button,
+                search_entry,
+                sort_button,
                 selection_label,
                 select_all_button,
                 selection_add_button,
@@ -263,6 +305,7 @@ impl Library {
                 songs_title,
                 songs_details,
                 songs_stack,
+                no_results,
                 songs,
                 playlists,
                 open_playlist: RefCell::new(None),
@@ -340,7 +383,22 @@ impl Library {
             }
         });
 
-        // The song list tells us when its ticks or its songs changed.
+        // Typing in the search box filters the list. Closing the search (Esc,
+        // or the button) empties the box, which shows every song again.
+        let this = Rc::downgrade(self);
+        self.search_entry.connect_search_changed(move |entry| {
+            if let Some(this) = this.upgrade() {
+                this.songs.set_query(&entry.text());
+            }
+        });
+        let entry = self.search_entry.clone();
+        self.search_button.connect_toggled(move |button| {
+            if !button.is_active() {
+                entry.set_text("");
+            }
+        });
+
+        // The song list tells us when its ticks or its shown songs changed.
         let this = Rc::downgrade(self);
         self.songs.connect_selection_changed(move || {
             if let Some(this) = this.upgrade() {
@@ -355,20 +413,21 @@ impl Library {
             }
         });
 
-        // Selecting is only for the song list: leave it on the Playlists tab,
-        // and only show the button on the Songs tab.
+        // Selecting and searching are only for the song list: leave selection
+        // mode on the Playlists tab, and only show the buttons on the Songs tab.
         let this = Rc::downgrade(self);
         tabs.connect_visible_child_name_notify(move |tabs| {
             if let Some(this) = this.upgrade() {
                 let on_songs = tabs.visible_child_name().as_deref() == Some("songs");
                 this.select_button.set_visible(on_songs);
+                this.search_button.set_visible(on_songs);
                 if !on_songs {
                     this.select_button.set_active(false);
                 }
             }
         });
 
-        // Esc leaves selection mode, Ctrl+A selects every song.
+        // Esc leaves selection mode, Ctrl+A selects every shown song, Ctrl+F starts a search.
         let shortcuts = gtk::ShortcutController::new();
         let this = Rc::downgrade(self);
         shortcuts.add_shortcut(gtk::Shortcut::new(
@@ -387,7 +446,19 @@ impl Library {
             Some(gtk::CallbackAction::new(move |_, _| match this.upgrade() {
                 Some(this) if this.select_button.is_visible() && !this.busy.get() => {
                     this.select_button.set_active(true);
-                    this.songs.select_all(true);
+                    this.songs.select_shown(true);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            })),
+        ));
+        let this = Rc::downgrade(self);
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control>f"),
+            Some(gtk::CallbackAction::new(move |_, _| match this.upgrade() {
+                Some(this) if this.search_button.is_visible() => {
+                    this.search_button.set_active(true);
+                    this.search_entry.grab_focus();
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -445,6 +516,30 @@ impl Library {
             this.change(|db| db.remove_from_playlist(playlist, id));
         });
         self.add_action::<PlaylistId>("delete-playlist", |this, id| this.confirm_delete_playlist(id));
+        self.add_sort_action();
+    }
+
+    /// The "Sort by" menu: an action that *remembers* which item is picked.
+    /// A stateful action keeps a value (here the sort mode's name), and the
+    /// menu draws a radio button for the item whose target equals it.
+    fn add_sort_action(self: &Rc<Self>) {
+        let initial = SortMode::default().id().to_variant();
+        let action = gio::SimpleAction::new_stateful("sort", Some(glib::VariantTy::STRING), &initial);
+        let this = Rc::downgrade(self);
+        // For a stateful action whose value has the same type as its target,
+        // activating a menu item asks to change the state to that target.
+        action.connect_change_state(move |action, state| {
+            let Some(state) = state else {
+                return;
+            };
+            let (Some(this), Some(mode)) = (this.upgrade(), state.str().and_then(SortMode::from_id)) else {
+                return;
+            };
+            action.set_state(state);
+            this.songs.set_sort(mode);
+            this.sort_button.set_label(&sort_label(mode));
+        });
+        self.actions.add_action(&action);
     }
 
     /// Adds an action whose parameter is a `T`, like a u64 id.
@@ -599,31 +694,53 @@ impl Library {
 
     fn update_selection_bar(&self) {
         let stats = self.songs.stats();
-        self.selection_label.set_text(&match stats.selected {
-            0 => "Select songs".to_string(),
-            count => format!("{} selected", songs_count(count)),
+        // Songs ticked earlier can be hidden by a newer search; say so, because
+        // deleting would include them.
+        let hidden = stats.selected - stats.shown_selected;
+        self.selection_label.set_text(&match (stats.selected, hidden) {
+            (0, _) => "Select songs".to_string(),
+            (count, 0) => format!("{} selected", songs_count(count)),
+            (count, hidden) => format!("{} selected, {hidden} hidden by the search", songs_count(count)),
         });
         self.selection_add_button.set_sensitive(stats.selected > 0);
         self.selection_delete_button.set_sensitive(stats.selected > 0);
-        let all_ticked = stats.total > 0 && stats.selected == stats.total;
+        let all_ticked = stats.shown > 0 && stats.shown_selected == stats.shown;
         self.select_all_button.set_label(if all_ticked { "Select None" } else { "Select All" });
-        self.select_all_button.set_sensitive(stats.total > 0);
+        self.select_all_button.set_sensitive(stats.shown > 0);
     }
 
-    /// Ticks every song, or unticks them when they're all ticked already.
+    /// Ticks every shown song, or unticks them when they're all ticked already.
     fn toggle_select_all(&self) {
         let stats = self.songs.stats();
-        let all_ticked = stats.total > 0 && stats.selected == stats.total;
-        self.songs.select_all(!all_ticked);
+        let all_ticked = stats.shown > 0 && stats.shown_selected == stats.shown;
+        self.songs.select_shown(!all_ticked);
     }
 
-    /// The "35 Songs · 2h 5m" line above the list, and whether the list or the
-    /// "No Songs Yet" page is showing.
+    /// The "35 Songs · 2h 5m" line above the list, and whether the list or one
+    /// of the "nothing here" pages is showing.
     fn update_songs_view(&self) {
         let stats = self.songs.stats();
-        let songs = if stats.total == 1 { "1 Song".to_string() } else { format!("{} Songs", stats.total) };
-        self.songs_title.set_text(&format!("{songs} · {}", format_duration(stats.length)));
-        self.songs_stack.set_visible_child_name(if stats.total == 0 { "empty" } else { "list" });
+        let songs = |count: usize| if count == 1 { "1 Song".to_string() } else { format!("{count} Songs") };
+        let length = format_duration(stats.shown_length);
+        self.songs_title.set_text(&if stats.shown == stats.total {
+            format!("{} · {length}", songs(stats.total))
+        } else {
+            format!("{} of {} · {length}", stats.shown, songs(stats.total))
+        });
+
+        let page = if stats.total == 0 {
+            "empty"
+        } else if stats.shown == 0 {
+            "no-results"
+        } else {
+            "list"
+        };
+        if page == "no-results" {
+            // The description of a status page is markup, so escape the text.
+            let query = glib::markup_escape_text(self.search_entry.text().trim());
+            self.no_results.set_description(Some(&format!("No songs match “{query}”")));
+        }
+        self.songs_stack.set_visible_child_name(page);
     }
 
     /// The ticked songs, in the order the list shows them.
@@ -1144,6 +1261,21 @@ fn boxed_list(placeholder: &str) -> gtk::ListBox {
     list
 }
 
+/// The "Sort by" menu: one radio item per sort mode, all for the `library.sort` action.
+fn sort_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    for mode in SortMode::ALL {
+        let item = gio::MenuItem::new(Some(mode.label()), None);
+        item.set_action_and_target_value(Some("library.sort"), Some(&mode.id().to_variant()));
+        menu.append_item(&item);
+    }
+    menu
+}
+
+fn sort_label(mode: SortMode) -> String {
+    format!("Sort by {}", mode.label())
+}
+
 /// For trying the song list with a big library. In a debug build,
 /// `OXIPOD_FAKE_SONGS=5000 cargo run` adds that many made-up songs to the
 /// list. They aren't in the database, so deleting one or adding it to a
@@ -1159,6 +1291,9 @@ fn with_test_songs(mut tracks: Vec<Track>) -> Vec<Track> {
         artist: Some(format!("Fake Artist {}", n % 97)),
         album: Some(format!("Fake Album {}", n % 389)),
         length: Duration::from_secs(120 + n % 240),
+        track_number: (n % 12) as i32 + 1,
+        disc_number: 1,
+        added: 1_700_000_000 + n * 60,
     }));
     tracks
 }

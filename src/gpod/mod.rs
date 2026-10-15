@@ -54,6 +54,11 @@ pub struct Track {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub length: Duration,
+    /// Position on the album and the disc it is on (0 when the song doesn't say).
+    pub track_number: i32,
+    pub disc_number: i32,
+    /// When the song was put on the iPod, in seconds since 1970 (0 if unknown).
+    pub added: u64,
 }
 
 /// A normal playlist made by the user (not the master playlist, the podcast
@@ -570,6 +575,9 @@ unsafe fn track_from_raw(track: &ffi::Itdb_Track) -> Track {
             artist: string_from_c(track.artist),
             album: string_from_c(track.album),
             length: Duration::from_millis(track.tracklen.max(0) as u64),
+            track_number: track.track_nr,
+            disc_number: track.cd_nr,
+            added: track.time_added.max(0) as u64,
         }
     }
 }
