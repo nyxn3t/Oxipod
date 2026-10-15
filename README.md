@@ -6,6 +6,11 @@ I wanted to use my old iPod nano again, but there's no good way to get music
 onto it from Linux anymore, so I made this. You plug in your iPod, drop some
 music on the window, and that's it.
 
+<p align="center">
+  <img src="data/screenshots/songs.png" width="340" alt="The songs on an iPod nano">
+  <img src="data/screenshots/search.png" width="340" alt="Searching the songs">
+</p>
+
 ## What it does
 
 - Add songs or whole album folders by dragging them onto the window (or with
