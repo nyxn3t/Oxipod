@@ -73,6 +73,9 @@ pub struct Library {
     /// Switches between the song list and the "nothing here" pages.
     songs_stack: gtk::Stack,
     no_results: adw::StatusPage,
+    /// Explains the possible duplicates and offers "Select Extra Copies"; only
+    /// shown above the list while it shows them.
+    duplicates_hint: gtk::Box,
     /// The songs, their order, the search and the ticks (see `songs.rs`).
     songs: SongList,
     playlists: gtk::ListBox,
@@ -178,6 +181,25 @@ impl Library {
         songs_stack.add_named(&empty_page, Some("empty"));
         songs_stack.add_named(&no_results, Some("no-results"));
 
+        // Above the list while it shows the possible duplicates. The button
+        // runs an action of the library, which is added further down.
+        let hint_label = gtk::Label::builder()
+            .label("The copy to keep comes first in each group: the highest bit rate, then one with a cover, then the bigger file.")
+            .xalign(0.0)
+            .wrap(true)
+            .hexpand(true)
+            .css_classes(["dim-label"])
+            .build();
+        let extra_copies_button = gtk::Button::builder()
+            .label("Select Extra Copies")
+            .valign(gtk::Align::Center)
+            .tooltip_text("Tick every copy except the best one of each song")
+            .action_name("library.select-extra-copies")
+            .build();
+        let duplicates_hint = gtk::Box::builder().spacing(12).visible(false).build();
+        duplicates_hint.append(&hint_label);
+        duplicates_hint.append(&extra_copies_button);
+
         let songs_column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -188,6 +210,7 @@ impl Library {
             .vexpand(true)
             .build();
         songs_column.append(&heading);
+        songs_column.append(&duplicates_hint);
         songs_column.append(&songs_stack);
         let songs_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         songs_page.append(&search_bar);
@@ -356,6 +379,7 @@ impl Library {
                 songs_details,
                 songs_stack,
                 no_results,
+                duplicates_hint,
                 songs,
                 playlists,
                 open_playlist: RefCell::new(None),
@@ -569,6 +593,7 @@ impl Library {
         self.add_action::<TrackId>("remove-cover", |this, id| this.remove_covers(vec![id]));
         self.add_action::<()>("choose-cover-selected", |this, ()| this.choose_cover(this.selected_ids()));
         self.add_action::<()>("remove-cover-selected", |this, ()| this.remove_covers(this.selected_ids()));
+        self.add_action::<()>("select-extra-copies", |this, ()| this.select_extra_copies());
         self.add_action::<TrackId>("new-playlist-with-song", |this, id| {
             this.ask_playlist_name(vec![id]);
         });
@@ -610,6 +635,8 @@ impl Library {
             action.set_state(state);
             this.songs.set_filter(filter);
             this.filter_button.set_label(filter.label());
+            // The possible duplicates are grouped, so sorting them makes no sense.
+            this.sort_button.set_visible(filter != SongFilter::Duplicates);
             this.update_songs_view();
         });
         self.actions.add_action(&action);
@@ -811,6 +838,25 @@ impl Library {
         self.songs.select_shown(!all_ticked);
     }
 
+    /// Ticks every copy in the list of possible duplicates except the best one
+    /// of each song, so the extra copies can be deleted in one go. Nothing is
+    /// deleted here: the person looks over what got ticked first.
+    fn select_extra_copies(&self) {
+        if self.busy.get() {
+            self.toast("Wait until the current job is done");
+            return;
+        }
+        let extra = self.songs.extra_copies();
+        // Turning selection mode on first: it starts with nothing ticked.
+        self.select_button.set_active(true);
+        self.songs.select_only(&extra);
+        self.toast(&match extra.len() {
+            0 => "There are no extra copies to select".to_string(),
+            1 => "Ticked 1 extra copy. Have a look, then press Delete".to_string(),
+            count => format!("Ticked {count} extra copies. Have a look, then press Delete"),
+        });
+    }
+
     /// The "35 Songs · 2h 5m" line above the list, and whether the list or one
     /// of the "nothing here" pages is showing.
     fn update_songs_view(&self) {
@@ -822,7 +868,12 @@ impl Library {
             SongFilter::All if stats.shown == stats.total => format!("{} · {length}", songs(stats.total)),
             SongFilter::All => format!("{} of {} · {length}", stats.shown, songs(stats.total)),
             SongFilter::NoCover => format!("{} Without Cover Art · {length}", songs(stats.shown)),
+            SongFilter::Duplicates => {
+                let groups = if stats.groups == 1 { "1 Group".to_string() } else { format!("{} Groups", stats.groups) };
+                format!("{} in {groups} · {length}", songs(stats.shown))
+            }
         });
+        self.duplicates_hint.set_visible(filter == SongFilter::Duplicates && stats.shown > 0);
 
         let page = if stats.total == 0 {
             "empty"
@@ -834,25 +885,31 @@ impl Library {
         if page == "no-results" {
             // The page says why nothing is shown: the search, or the filter.
             // The description of a status page is markup, so escape the text.
-            let query = self.search_entry.text();
-            let query = query.trim();
-            if !query.is_empty() {
-                self.no_results.set_icon_name(Some("edit-find-symbolic"));
-                self.no_results.set_title("No Results");
-                let text = match filter {
-                    SongFilter::All => format!("No songs match “{}”", glib::markup_escape_text(query)),
-                    SongFilter::NoCover => format!("No song without cover art matches “{}”", glib::markup_escape_text(query)),
-                };
-                self.no_results.set_description(Some(&text));
-            } else {
-                match filter {
-                    SongFilter::NoCover => {
-                        self.no_results.set_icon_name(Some("emblem-ok-symbolic"));
-                        self.no_results.set_title("Every Song Has a Cover");
-                        self.no_results.set_description(Some("There are no songs without cover art."));
-                    }
-                    SongFilter::All => {}
+            let query = glib::markup_escape_text(self.search_entry.text().trim());
+            let searching = !query.is_empty();
+            let message = match (searching, filter) {
+                (true, SongFilter::All) => Some(("edit-find-symbolic", "No Results", format!("No songs match “{query}”"))),
+                (true, SongFilter::NoCover) => {
+                    Some(("edit-find-symbolic", "No Results", format!("No song without cover art matches “{query}”")))
                 }
+                (true, SongFilter::Duplicates) => {
+                    Some(("edit-find-symbolic", "No Results", format!("No possible duplicate matches “{query}”")))
+                }
+                (false, SongFilter::NoCover) => {
+                    Some(("emblem-ok-symbolic", "Every Song Has a Cover", "There are no songs without cover art.".to_string()))
+                }
+                (false, SongFilter::Duplicates) => Some((
+                    "emblem-ok-symbolic",
+                    "No Duplicates Found",
+                    "No two songs have the same title, artist and length.".to_string(),
+                )),
+                // With every song shown there is nothing to explain.
+                (false, SongFilter::All) => None,
+            };
+            if let Some((icon, title, description)) = message {
+                self.no_results.set_icon_name(Some(icon));
+                self.no_results.set_title(title);
+                self.no_results.set_description(Some(&description));
             }
         }
         self.songs_stack.set_visible_child_name(page);

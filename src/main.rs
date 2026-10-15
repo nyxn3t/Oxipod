@@ -1,6 +1,7 @@
 mod convert;
 mod covers;
 mod device;
+mod duplicates;
 mod eject;
 mod export;
 mod gpod;

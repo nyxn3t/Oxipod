@@ -9,13 +9,14 @@
 //! ```text
 //!   ListView          draws the rows
 //!   NoSelection       (GTK's own selection is off, the songs know if they're ticked)
-//!   FilterListModel   hides the songs that don't match the search
+//!   FilterListModel   hides the songs that don't match the search or the filter
 //!   SortListModel     puts the songs in order
 //!   ListStore         every song on the iPod
 //! ```
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, gio, glib};
 
+use crate::duplicates::find_duplicates;
 use crate::gpod::{Track, TrackId};
 use crate::library::{COVER_SIZE, format_duration};
 
@@ -136,16 +138,19 @@ pub enum SongFilter {
     All,
     /// Songs the iPod has no cover art for.
     NoCover,
+    /// Songs that look like another song on the iPod (see `duplicates.rs`).
+    Duplicates,
 }
 
 impl SongFilter {
-    pub const ALL: [SongFilter; 2] = [SongFilter::All, SongFilter::NoCover];
+    pub const ALL: [SongFilter; 3] = [SongFilter::All, SongFilter::NoCover, SongFilter::Duplicates];
 
     /// The name used for the menu action's value.
     pub fn id(self) -> &'static str {
         match self {
             SongFilter::All => "all",
             SongFilter::NoCover => "no-cover",
+            SongFilter::Duplicates => "duplicates",
         }
     }
 
@@ -157,6 +162,7 @@ impl SongFilter {
         match self {
             SongFilter::All => "All Songs",
             SongFilter::NoCover => "Without Cover Art",
+            SongFilter::Duplicates => "Possible Duplicates",
         }
     }
 }
@@ -191,6 +197,10 @@ mod imp {
         pub(super) has_cover: Cell<bool>,
         /// True while a row is showing this song.
         pub(super) bound: Cell<bool>,
+        /// When the song looks like others: which group of copies it is in and
+        /// how good a copy it is within the group (0 is the one to keep). Like
+        /// the cover this depends on the other songs, so it can change.
+        pub(super) duplicate: Cell<Option<(u32, u32)>>,
     }
 
     #[glib::object_subclass]
@@ -235,6 +245,16 @@ impl SongObject {
     /// Records whether the song has a cover; says whether that is news.
     fn set_has_cover(&self, has_cover: bool) -> bool {
         self.imp().has_cover.replace(has_cover) != has_cover
+    }
+
+    /// The song's group of possible duplicates and its rank in it, if it has one.
+    fn duplicate(&self) -> Option<(u32, u32)> {
+        self.imp().duplicate.get()
+    }
+
+    /// Records the group and rank; says whether that is news.
+    fn set_duplicate(&self, duplicate: Option<(u32, u32)>) -> bool {
+        self.imp().duplicate.replace(duplicate) != duplicate
     }
 
     pub fn song(&self) -> &Song {
@@ -282,6 +302,8 @@ pub struct Stats {
     pub shown: usize,
     /// Playing time of the songs that are shown.
     pub shown_length: Duration,
+    /// How many groups of possible duplicates the shown songs belong to.
+    pub groups: usize,
     /// Ticked songs, including those the search hides.
     pub selected: usize,
     pub shown_selected: usize,
@@ -302,6 +324,8 @@ pub struct SongList {
     filter_mode: Rc<Cell<SongFilter>>,
     /// Loads a cover from the iPod; asked again when covers change.
     load_cover: CoverLoader,
+    /// Never shown. The rows follow it to know whether to show a copy's details.
+    show_details: gtk::ToggleButton,
     selection_changed: Rc<Notifier>,
     shown_changed: Rc<Notifier>,
 }
@@ -325,12 +349,18 @@ impl SongList {
         // `move` hands the closure its own copy of `sort_mode` (the Rc is
         // cloned first, so both the list and the sorter keep one).
         let sorter = gtk::CustomSorter::new({
-            let sort_mode = sort_mode.clone();
+            let (sort_mode, filter_mode) = (sort_mode.clone(), filter_mode.clone());
             move |a, b| {
                 // The model only ever holds SongObjects, so these can't fail.
                 let a = a.downcast_ref::<SongObject>().expect("a SongObject");
                 let b = b.downcast_ref::<SongObject>().expect("a SongObject");
-                a.song().compare(b.song(), sort_mode.get()).into()
+                let by_mode = || a.song().compare(b.song(), sort_mode.get());
+                if filter_mode.get() == SongFilter::Duplicates {
+                    // Copies of a song sit together, the best copy first.
+                    a.duplicate().cmp(&b.duplicate()).then_with(by_mode).into()
+                } else {
+                    by_mode().into()
+                }
             }
         });
         let sorted = gtk::SortListModel::new(Some(store.clone()), Some(sorter.clone()));
@@ -342,6 +372,7 @@ impl SongList {
                 let wanted = match filter_mode.get() {
                     SongFilter::All => true,
                     SongFilter::NoCover => !song.has_cover(),
+                    SongFilter::Duplicates => song.duplicate().is_some(),
                 };
                 wanted && song.song().matches(&words.borrow())
             }
@@ -349,7 +380,8 @@ impl SongList {
         let filtered = gtk::FilterListModel::new(Some(sorted.clone()), Some(filter.clone()));
 
         let selection = gtk::NoSelection::new(Some(filtered.clone()));
-        let factory = row_factory(select_button, load_cover.clone(), Rc::new(song_menu));
+        let show_details = gtk::ToggleButton::new();
+        let factory = row_factory(select_button, &show_details, load_cover.clone(), Rc::new(song_menu));
         let view = gtk::ListView::builder()
             .model(&selection)
             .factory(&factory)
@@ -389,6 +421,7 @@ impl SongList {
             words,
             filter_mode,
             load_cover,
+            show_details,
             selection_changed: Rc::default(),
             shown_changed,
         }
@@ -415,8 +448,8 @@ impl SongList {
     /// tick, their cover and the scroll position stays put. Only the songs
     /// that are gone are removed, and the new ones added.
     pub fn set_tracks(&self, tracks: &[Track]) {
-        let wanted: std::collections::HashMap<TrackId, &Track> = tracks.iter().map(|track| (track.id, track)).collect();
-        let mut present = std::collections::HashSet::new();
+        let wanted: HashMap<TrackId, &Track> = tracks.iter().map(|track| (track.id, track)).collect();
+        let mut present = HashSet::new();
         let mut gone = Vec::new();
         let mut covers_changed = false;
         for (position, song) in songs_in(&self.store).enumerate() {
@@ -445,9 +478,28 @@ impl SongList {
             })
             .collect();
         self.store.extend_from_slice(&new_songs);
-        // Which songs the "without cover art" filter lets through may have changed.
-        if covers_changed && self.filter_mode.get() != SongFilter::All {
+
+        // Which songs look like copies of each other can change whenever songs
+        // come or go. The groups are numbered in the order `find_duplicates`
+        // gives them, and each song's rank is its place in its group.
+        let mut positions: HashMap<TrackId, (u32, u32)> = HashMap::new();
+        for (group, ids) in find_duplicates(tracks).iter().enumerate() {
+            for (rank, id) in ids.iter().enumerate() {
+                positions.insert(*id, (group as u32, rank as u32));
+            }
+        }
+        let mut duplicates_changed = false;
+        for song in songs_in(&self.store) {
+            duplicates_changed |= song.set_duplicate(positions.get(&song.id()).copied());
+        }
+
+        // Tell the filter and sorter when what they look at may have changed.
+        let filter = self.filter_mode.get();
+        if (covers_changed && filter == SongFilter::NoCover) || (duplicates_changed && filter == SongFilter::Duplicates) {
             self.filter.changed(gtk::FilterChange::Different);
+        }
+        if duplicates_changed && filter == SongFilter::Duplicates {
+            self.sorter.changed(gtk::SorterChange::Different);
         }
     }
 
@@ -455,7 +507,7 @@ impl SongList {
     /// that were loaded for them. Rows that are showing one of them load the
     /// new picture at once, the others when they come into view.
     pub fn reset_covers(&self, ids: &[TrackId]) {
-        let ids: std::collections::HashSet<TrackId> = ids.iter().copied().collect();
+        let ids: HashSet<TrackId> = ids.iter().copied().collect();
         for song in songs_in(&self.store).filter(|song| ids.contains(&song.id())) {
             song.imp().cover_requested.set(false);
             song.set_cover(None::<&gdk::Texture>);
@@ -466,8 +518,15 @@ impl SongList {
     }
 
     pub fn set_filter(&self, filter: SongFilter) {
-        if self.filter_mode.replace(filter) != filter {
-            self.filter.changed(gtk::FilterChange::Different);
+        let before = self.filter_mode.replace(filter);
+        if before == filter {
+            return;
+        }
+        self.show_details.set_active(filter == SongFilter::Duplicates);
+        self.filter.changed(gtk::FilterChange::Different);
+        // The duplicates are ordered by group, whatever the list is sorted by.
+        if filter == SongFilter::Duplicates || before == SongFilter::Duplicates {
+            self.sorter.changed(gtk::SorterChange::Different);
         }
     }
 
@@ -506,16 +565,20 @@ impl SongList {
             total: self.store.n_items() as usize,
             shown: self.filtered.n_items() as usize,
             shown_length: Duration::ZERO,
+            groups: 0,
             selected: 0,
             shown_selected: 0,
         };
         for song in songs_in(&self.store) {
             stats.selected += usize::from(song.selected());
         }
+        let mut groups = HashSet::new();
         for song in songs_in(&self.filtered) {
             stats.shown_length += song.song().track.length;
             stats.shown_selected += usize::from(song.selected());
+            groups.extend(song.duplicate().map(|(group, _)| group));
         }
+        stats.groups = groups.len();
         stats
     }
 
@@ -542,6 +605,30 @@ impl SongList {
         for song in songs_in(&self.store) {
             song.set_selected(false);
         }
+    }
+
+    /// Ticks exactly these songs and unticks all the others.
+    pub fn select_only(&self, ids: &[TrackId]) {
+        let ids: HashSet<TrackId> = ids.iter().copied().collect();
+        for song in songs_in(&self.store) {
+            song.set_selected(ids.contains(&song.id()));
+        }
+    }
+
+    /// The shown songs that have a better copy among the shown songs: what is
+    /// left of each group of possible duplicates once its best copy is kept.
+    /// (A song whose better copies are all hidden by the search stays.)
+    pub fn extra_copies(&self) -> Vec<TrackId> {
+        // The rank of the best copy that is shown, for each group.
+        let mut best: HashMap<u32, u32> = HashMap::new();
+        for (group, rank) in songs_in(&self.filtered).filter_map(|song| song.duplicate()) {
+            let best = best.entry(group).or_insert(rank);
+            *best = (*best).min(rank);
+        }
+        songs_in(&self.filtered)
+            .filter(|song| song.duplicate().is_some_and(|(group, rank)| rank > best[&group]))
+            .map(|song| song.id())
+            .collect()
     }
 }
 
@@ -587,11 +674,12 @@ type MenuBuilder = Rc<dyn Fn(&Track, bool) -> gio::Menu>;
 /// you scroll: the row's `item` changes, and we fill the widgets in again.
 fn row_factory(
     select_button: &gtk::ToggleButton,
+    show_details: &gtk::ToggleButton,
     load_cover: CoverLoader,
     song_menu: MenuBuilder,
 ) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
-    let select_button = select_button.clone();
+    let (select_button, show_details) = (select_button.clone(), show_details.clone());
 
     factory.connect_setup(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("the factory makes ListItems");
@@ -607,6 +695,12 @@ fn row_factory(
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
             .build();
+        // What tells copies of a song apart; only shown with the possible duplicates.
+        let details_label = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
         let text = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .valign(gtk::Align::Center)
@@ -614,6 +708,7 @@ fn row_factory(
             .build();
         text.append(&title);
         text.append(&subtitle);
+        text.append(&details_label);
         let length = gtk::Label::builder().css_classes(["dim-label", "numeric"]).build();
         let menu = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
@@ -642,6 +737,7 @@ fn row_factory(
         select_button.bind_property("active", &check, "visible").sync_create().build();
         select_button.bind_property("active", &menu, "visible").sync_create().invert_boolean().build();
         select_button.bind_property("active", list_item, "activatable").sync_create().build();
+        show_details.bind_property("active", &details_label, "visible").sync_create().build();
 
         // The widgets below are children of the list item, so they must only
         // hold a *weak* reference back to it, or neither could ever be freed.
@@ -685,6 +781,7 @@ fn row_factory(
             subtitle.set_visible(!details.is_empty());
             subtitle.set_text(&details);
             length.set_text(&format_duration(track.length));
+            details_label.set_text(&copy_details(track));
 
             check.set_active(song.selected());
             show_cover(&cover, song.cover().as_ref());
@@ -706,6 +803,29 @@ fn row_factory(
         });
     });
     factory
+}
+
+/// What tells copies of a song apart, like "5.2 MB · 320 kbps · added 12 Oct 2026".
+/// Parts the song doesn't know are left out.
+fn copy_details(track: &Track) -> String {
+    let mut parts = Vec::new();
+    if track.size > 0 {
+        parts.push(glib::format_size(u64::from(track.size)).to_string());
+    }
+    if track.bitrate > 0 {
+        parts.push(format!("{} kbps", track.bitrate));
+    }
+    // `added` counts seconds since 1970; 0 means unknown. Each step gives
+    // `None` if it fails, which ends the chain and leaves the date out.
+    let added = i64::try_from(track.added)
+        .ok()
+        .filter(|&seconds| seconds > 0)
+        .and_then(|seconds| glib::DateTime::from_unix_local(seconds).ok())
+        .and_then(|date| date.format("%-d %b %Y").ok());
+    if let Some(added) = added {
+        parts.push(format!("added {added}"));
+    }
+    parts.join(" · ")
 }
 
 /// Shows a song's cover, or a plain music note when it has none. The note is
@@ -819,6 +939,84 @@ mod tests {
         assert!(!narrower(&words("lorna"), &words("shore")));
     }
 
+    #[test]
+    fn every_filter_can_be_found_by_its_name() {
+        for filter in SongFilter::ALL {
+            assert_eq!(SongFilter::from_id(filter.id()), Some(filter));
+        }
+        assert_eq!(SongFilter::from_id("nonsense"), None);
+    }
+
+    #[test]
+    fn describes_a_copy_by_what_tells_copies_apart() {
+        let text = copy_details(&Track { size: 5_200_000, bitrate: 320, ..Default::default() });
+        assert!(text.contains("MB") && text.contains("320 kbps"), "{text}");
+        // Added at 12:00 UTC on 12 October 2026: the day is the same in every time zone.
+        let text = copy_details(&Track { added: 1_791_806_400, ..Default::default() });
+        assert!(text.starts_with("added ") && text.contains("2026"), "{text}");
+        assert_eq!(copy_details(&Track::default()), "");
+    }
+
+    /// The filters on a small library: songs without a cover, and possible
+    /// duplicates. The GTK test below runs this, because GTK can be started
+    /// only once per program.
+    fn check_the_filters(button: &gtk::ToggleButton) {
+        let track = |id: u64, title: &str, artist: &str, seconds: u64, bitrate: i32, has_cover: bool| Track {
+            id,
+            title: Some(title.to_string()),
+            artist: Some(artist.to_string()),
+            length: Duration::from_secs(seconds),
+            bitrate,
+            has_cover,
+            ..Default::default()
+        };
+        let mut tracks = vec![
+            track(1, "Alpha", "Abe", 100, 320, true),
+            track(2, "alpha", "ABE", 100, 128, false), // a worse copy of 1
+            track(3, "Beta", "Abe", 100, 320, false),
+            track(4, "Gamma", "Abe", 100, 320, true),
+            track(5, "Gamma!", "Abe", 101, 320, true), // a copy of 4
+            track(6, "Delta", "Abe", 100, 320, false),
+        ];
+        let list = SongList::new(button, |_| None, |_, _| gio::Menu::new());
+        list.set_tracks(&tracks);
+        let shown = |list: &SongList| songs_in(&list.filtered).map(|song| song.id()).collect::<Vec<_>>();
+        // Everything, by title.
+        assert_eq!(shown(&list), [1, 2, 3, 6, 4, 5]);
+
+        // Without a cover: the songs the iPod has no picture for.
+        list.set_filter(SongFilter::NoCover);
+        assert_eq!(shown(&list), [2, 3, 6]);
+        // A cover arrives for song 3 and it leaves the list by itself.
+        tracks[2].has_cover = true;
+        list.set_tracks(&tracks);
+        assert_eq!(shown(&list), [2, 6]);
+
+        // Possible duplicates: copies sit together, the best copy first.
+        list.set_filter(SongFilter::Duplicates);
+        assert_eq!(shown(&list), [1, 2, 4, 5]);
+        let stats = list.stats();
+        assert_eq!((stats.shown, stats.groups), (4, 2));
+        assert_eq!(list.extra_copies(), [2, 5]);
+        // A search that hides the better copy leaves nothing to compare with.
+        list.set_query("gamma!");
+        assert_eq!(shown(&list), [5]);
+        assert!(list.extra_copies().is_empty());
+        list.set_query("");
+
+        // Ticking exactly the extra copies...
+        list.select_only(&list.extra_copies());
+        assert_eq!(list.selected_ids(), [2, 5]);
+        // ...and deleting one of them dissolves its group.
+        tracks.retain(|track| track.id != 2);
+        list.set_tracks(&tracks);
+        assert_eq!(shown(&list), [4, 5]);
+        assert_eq!(list.stats().groups, 1);
+
+        list.set_filter(SongFilter::All);
+        assert_eq!(list.stats().shown, 5);
+    }
+
     /// How many widgets of one GTK type there are inside `widget`.
     fn count_widgets(widget: &gtk::Widget, type_name: &str) -> usize {
         let mut count = usize::from(widget.type_().name() == type_name);
@@ -909,5 +1107,7 @@ mod tests {
         settle();
         assert_eq!(list.stats().selected, 0);
         window.close();
+
+        check_the_filters(&button);
     }
 }
