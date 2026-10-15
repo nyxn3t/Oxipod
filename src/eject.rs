@@ -96,13 +96,91 @@ fn lookup(dictionary: &Variant, key: &str) -> Option<Variant> {
         .find(|entry| entry.child_value(0).str() == Some(key))
         .map(|entry| {
             let value = entry.child_value(1);
-            value.as_variant().unwrap_or(value)
+            // Only a `v` can be unwrapped. Asking any other value to do it
+            // makes GLib print a CRITICAL warning, even though the answer
+            // (the value itself) would have been right.
+            if value.is_type(glib::VariantTy::VARIANT) {
+                value.as_variant().unwrap_or(value)
+            } else {
+                value
+            }
         })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glib::prelude::ToVariant;
+
+    /// A D-Bus dictionary `a{sv}`: every value wrapped in a variant (`v`), as UDisks2 sends it.
+    fn properties(entries: &[(&str, Variant)]) -> Variant {
+        Variant::array_from_iter_with_type(
+            glib::VariantTy::new("{sv}").unwrap(),
+            entries
+                .iter()
+                .map(|(key, value)| Variant::from_dict_entry(&key.to_variant(), &Variant::from_variant(value))),
+        )
+    }
+
+    /// A dictionary `a{sa{sv}}` from interface names to their properties. The
+    /// values are *not* variants here, which is what `lookup` must cope with.
+    fn interfaces(entries: &[(&str, Variant)]) -> Variant {
+        Variant::array_from_iter_with_type(
+            glib::VariantTy::new("{sa{sv}}").unwrap(),
+            entries.iter().map(|(key, value)| Variant::from_dict_entry(&key.to_variant(), value)),
+        )
+    }
+
+    /// A trimmed-down `GetManagedObjects` answer: a partition mounted elsewhere
+    /// and the iPod's partition with the drive it is on.
+    fn managed_objects() -> Variant {
+        let mount_point = |path: &str| {
+            let mut bytes = path.as_bytes().to_vec();
+            bytes.push(0);
+            let points = Variant::array_from_iter_with_type(glib::VariantTy::new("ay").unwrap(), [bytes.to_variant()]);
+            properties(&[("MountPoints", points)])
+        };
+        let block = |drive: &str| {
+            let drive = glib::variant::ObjectPath::try_from(drive).unwrap().to_variant();
+            properties(&[("Drive", drive)])
+        };
+        let object = |path: &str, interfaces: Variant| {
+            let path = glib::variant::ObjectPath::try_from(path).unwrap().to_variant();
+            Variant::from_dict_entry(&path, &interfaces)
+        };
+        Variant::array_from_iter_with_type(
+            glib::VariantTy::new("{oa{sa{sv}}}").unwrap(),
+            [
+                object(
+                    "/org/freedesktop/UDisks2/block_devices/sda1",
+                    interfaces(&[
+                        ("org.freedesktop.UDisks2.Filesystem", mount_point("/mnt/hdd3tb")),
+                        ("org.freedesktop.UDisks2.Block", block("/org/freedesktop/UDisks2/drives/Disk")),
+                    ]),
+                ),
+                object(
+                    "/org/freedesktop/UDisks2/block_devices/sdb1",
+                    interfaces(&[
+                        ("org.freedesktop.UDisks2.Filesystem", mount_point("/run/media/dylan/IPOD")),
+                        ("org.freedesktop.UDisks2.Block", block("/org/freedesktop/UDisks2/drives/Apple_iPod")),
+                    ]),
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn finds_the_filesystem_and_its_drive() {
+        let found = find_filesystem(&managed_objects(), Path::new("/run/media/dylan/IPOD"));
+        assert_eq!(
+            found,
+            Some((
+                "/org/freedesktop/UDisks2/block_devices/sdb1".to_string(),
+                Some("/org/freedesktop/UDisks2/drives/Apple_iPod".to_string())
+            ))
+        );
+        assert_eq!(find_filesystem(&managed_objects(), Path::new("/run/media/dylan/OTHER")), None);
+    }
 
     // Only looks the iPod up; doesn't eject it.
     #[test]
