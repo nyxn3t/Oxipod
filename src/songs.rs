@@ -129,6 +129,38 @@ impl SortMode {
     }
 }
 
+/// Which songs the list shows, apart from what the search says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SongFilter {
+    #[default]
+    All,
+    /// Songs the iPod has no cover art for.
+    NoCover,
+}
+
+impl SongFilter {
+    pub const ALL: [SongFilter; 2] = [SongFilter::All, SongFilter::NoCover];
+
+    /// The name used for the menu action's value.
+    pub fn id(self) -> &'static str {
+        match self {
+            SongFilter::All => "all",
+            SongFilter::NoCover => "no-cover",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<SongFilter> {
+        SongFilter::ALL.into_iter().find(|filter| filter.id() == id)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SongFilter::All => "All Songs",
+            SongFilter::NoCover => "Without Cover Art",
+        }
+    }
+}
+
 mod imp {
     use super::*;
 
@@ -153,6 +185,12 @@ mod imp {
         cover: RefCell<Option<gdk::Texture>>,
         /// True once somebody asked for the cover, so it's only asked for once.
         pub(super) cover_requested: Cell<bool>,
+        /// Whether the iPod has cover art for the song. Unlike the rest of the
+        /// song's facts this can change (covers can be set and removed), so
+        /// it lives here and not in the unchangeable `Song`.
+        pub(super) has_cover: Cell<bool>,
+        /// True while a row is showing this song.
+        pub(super) bound: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -184,8 +222,19 @@ glib::wrapper! {
 impl SongObject {
     fn new(track: Track) -> Self {
         let object: Self = glib::Object::new();
+        object.imp().has_cover.set(track.has_cover);
         assert!(object.imp().song.set(Song::new(track)).is_ok(), "a new object has no song yet");
         object
+    }
+
+    /// Whether the iPod has cover art for the song, right now.
+    pub fn has_cover(&self) -> bool {
+        self.imp().has_cover.get()
+    }
+
+    /// Records whether the song has a cover; says whether that is news.
+    fn set_has_cover(&self, has_cover: bool) -> bool {
+        self.imp().has_cover.replace(has_cover) != has_cover
     }
 
     pub fn song(&self) -> &Song {
@@ -249,6 +298,10 @@ pub struct SongList {
     sort_mode: Rc<Cell<SortMode>>,
     /// The search, split into lowercase words. Shared with the filter.
     words: Rc<RefCell<Vec<String>>>,
+    /// Which songs to show besides the search. Shared with the filter.
+    filter_mode: Rc<Cell<SongFilter>>,
+    /// Loads a cover from the iPod; asked again when covers change.
+    load_cover: CoverLoader,
     selection_changed: Rc<Notifier>,
     shown_changed: Rc<Notifier>,
 }
@@ -260,10 +313,12 @@ impl SongList {
     pub fn new(
         select_button: &gtk::ToggleButton,
         load_cover: impl Fn(TrackId) -> Option<gdk::Texture> + 'static,
-        song_menu: impl Fn(TrackId) -> gio::Menu + 'static,
+        song_menu: impl Fn(&Track, bool) -> gio::Menu + 'static,
     ) -> Self {
         let sort_mode = Rc::new(Cell::new(SortMode::default()));
         let words: Rc<RefCell<Vec<String>>> = Rc::default();
+        let filter_mode = Rc::new(Cell::new(SongFilter::default()));
+        let load_cover: CoverLoader = Rc::new(load_cover);
 
         let store = gio::ListStore::new::<SongObject>();
 
@@ -281,16 +336,20 @@ impl SongList {
         let sorted = gtk::SortListModel::new(Some(store.clone()), Some(sorter.clone()));
 
         let filter = gtk::CustomFilter::new({
-            let words = words.clone();
+            let (words, filter_mode) = (words.clone(), filter_mode.clone());
             move |item| {
                 let song = item.downcast_ref::<SongObject>().expect("a SongObject");
-                song.song().matches(&words.borrow())
+                let wanted = match filter_mode.get() {
+                    SongFilter::All => true,
+                    SongFilter::NoCover => !song.has_cover(),
+                };
+                wanted && song.song().matches(&words.borrow())
             }
         });
         let filtered = gtk::FilterListModel::new(Some(sorted.clone()), Some(filter.clone()));
 
         let selection = gtk::NoSelection::new(Some(filtered.clone()));
-        let factory = row_factory(select_button, Rc::new(load_cover), Rc::new(song_menu));
+        let factory = row_factory(select_button, load_cover.clone(), Rc::new(song_menu));
         let view = gtk::ListView::builder()
             .model(&selection)
             .factory(&factory)
@@ -328,6 +387,8 @@ impl SongList {
             scroller,
             sort_mode,
             words,
+            filter_mode,
+            load_cover,
             selection_changed: Rc::default(),
             shown_changed,
         }
@@ -354,14 +415,18 @@ impl SongList {
     /// tick, their cover and the scroll position stays put. Only the songs
     /// that are gone are removed, and the new ones added.
     pub fn set_tracks(&self, tracks: &[Track]) {
-        let wanted: std::collections::HashSet<TrackId> = tracks.iter().map(|track| track.id).collect();
+        let wanted: std::collections::HashMap<TrackId, &Track> = tracks.iter().map(|track| (track.id, track)).collect();
         let mut present = std::collections::HashSet::new();
         let mut gone = Vec::new();
+        let mut covers_changed = false;
         for (position, song) in songs_in(&self.store).enumerate() {
-            if wanted.contains(&song.id()) {
-                present.insert(song.id());
-            } else {
-                gone.push(position as u32);
+            match wanted.get(&song.id()) {
+                Some(track) => {
+                    present.insert(song.id());
+                    // A song that stays can still have got or lost its cover.
+                    covers_changed |= song.set_has_cover(track.has_cover);
+                }
+                None => gone.push(position as u32),
             }
         }
         // Remove from the back, so the positions still to be removed don't shift.
@@ -380,6 +445,34 @@ impl SongList {
             })
             .collect();
         self.store.extend_from_slice(&new_songs);
+        // Which songs the "without cover art" filter lets through may have changed.
+        if covers_changed && self.filter_mode.get() != SongFilter::All {
+            self.filter.changed(gtk::FilterChange::Different);
+        }
+    }
+
+    /// The covers of these songs were changed on the iPod: forget the pictures
+    /// that were loaded for them. Rows that are showing one of them load the
+    /// new picture at once, the others when they come into view.
+    pub fn reset_covers(&self, ids: &[TrackId]) {
+        let ids: std::collections::HashSet<TrackId> = ids.iter().copied().collect();
+        for song in songs_in(&self.store).filter(|song| ids.contains(&song.id())) {
+            song.imp().cover_requested.set(false);
+            song.set_cover(None::<&gdk::Texture>);
+            if song.imp().bound.get() {
+                request_cover(&song, &self.load_cover);
+            }
+        }
+    }
+
+    pub fn set_filter(&self, filter: SongFilter) {
+        if self.filter_mode.replace(filter) != filter {
+            self.filter.changed(gtk::FilterChange::Different);
+        }
+    }
+
+    pub fn filter(&self) -> SongFilter {
+        self.filter_mode.get()
     }
 
     pub fn set_sort(&self, mode: SortMode) {
@@ -482,11 +575,12 @@ impl Drop for Shown {
         for handler in self.handlers.drain(..) {
             self.song.disconnect(handler);
         }
+        self.song.imp().bound.set(false);
     }
 }
 
 type CoverLoader = Rc<dyn Fn(TrackId) -> Option<gdk::Texture>>;
-type MenuBuilder = Rc<dyn Fn(TrackId) -> gio::Menu>;
+type MenuBuilder = Rc<dyn Fn(&Track, bool) -> gio::Menu>;
 
 /// Builds the rows. GTK calls `setup` once for each row widget it creates (a
 /// screenful of them), and then reuses those widgets for different songs while
@@ -557,7 +651,7 @@ fn row_factory(
             // Called when the menu is about to open: build it for the song the row shows now.
             let song = weak_item.upgrade().and_then(|item| item.item()).and_downcast::<SongObject>();
             if let Some(song) = song {
-                button.set_menu_model(Some(&song_menu(song.id())));
+                button.set_menu_model(Some(&song_menu(&song.song().track, song.has_cover())));
             }
         });
 
@@ -607,6 +701,7 @@ fn row_factory(
                     move |song| show_cover(&cover, song.cover().as_ref())
                 }),
             ];
+            song.imp().bound.set(true);
             shown.replace(Some(Shown { song, handlers }));
         });
     });
@@ -746,7 +841,7 @@ mod tests {
 
         gtk::init().expect("GTK needs a display");
         let button = gtk::ToggleButton::new();
-        let list = SongList::new(&button, |_| None, |_| gio::Menu::new());
+        let list = SongList::new(&button, |_| None, |_, _| gio::Menu::new());
         let tracks: Vec<Track> = (0..20_000u64)
             .map(|n| Track {
                 id: n + 1,

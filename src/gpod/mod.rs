@@ -274,6 +274,36 @@ impl Database {
         }
     }
 
+    /// Gives each of these songs the cover `image`, replacing the one it has.
+    /// `image` is the bytes of a picture file (JPEG or PNG); libgpod turns it
+    /// into the sizes the iPod needs. Returns for how many songs that worked.
+    /// The covers reach the iPod with the next `save`.
+    pub fn set_cover(&mut self, ids: &[TrackId], image: &[u8]) -> Result<usize, Error> {
+        let mut done = 0;
+        for &id in ids {
+            let track = self.find_track(id)?;
+            // SAFETY: `track` belongs to the database. libgpod decodes the
+            // picture before returning, so `image` only has to live this long.
+            let worked = unsafe {
+                ffi::itdb_track_set_thumbnails_from_data(track, image.as_ptr(), image.len() as ffi::gsize)
+            };
+            if worked != 0 {
+                done += 1;
+            }
+        }
+        Ok(done)
+    }
+
+    /// Takes the cover away from each of these songs.
+    pub fn remove_cover(&mut self, ids: &[TrackId]) -> Result<(), Error> {
+        for &id in ids {
+            let track = self.find_track(id)?;
+            // SAFETY: `track` belongs to the database.
+            unsafe { ffi::itdb_track_remove_thumbnails(track) };
+        }
+        Ok(())
+    }
+
     /// Adds a song to the database and the master playlist, and picks where
     /// on the iPod its file goes. The caller copies `file` there (this can
     /// take a while, so it's left to the caller to do it off the main thread)
@@ -752,6 +782,84 @@ mod tests {
             tracks.len(),
             tracks.len() - with_cover
         );
+    }
+
+    // Gives a song without a cover a test picture, checks it after reopening the
+    // database, and takes it away again. Run with OXIPOD_TEST_IPOD set. Writes
+    // to the iPod, but leaves it as it was (the song had no cover).
+    #[test]
+    #[ignore = "writes to a mounted iPod"]
+    fn sets_and_removes_a_cover() {
+        use gtk::gdk_pixbuf::Colorspace;
+
+        let mount = std::env::var("OXIPOD_TEST_IPOD").expect("OXIPOD_TEST_IPOD is not set");
+        let path = Path::new(&mount);
+        let mut db = Database::open(path).expect("could not open the database");
+        let song = db.tracks().into_iter().find(|track| !track.has_cover).expect("a song without a cover");
+        let with_cover_before = db.tracks().iter().filter(|track| track.has_cover).count();
+
+        let picture = Pixbuf::new(Colorspace::Rgb, false, 8, 256, 256).unwrap();
+        picture.fill(0xed8150ff);
+        let jpeg = picture.save_to_bufferv("jpeg", &[("quality", "90")]).unwrap();
+
+        assert_eq!(db.set_cover(&[song.id], &jpeg).unwrap(), 1);
+        db.save().unwrap();
+        drop(db);
+        let mut db = Database::open(path).expect("could not reopen the database");
+        assert!(db.cover(song.id, 40).is_some(), "the cover should be there after reopening");
+        assert!(db.tracks().iter().any(|track| track.id == song.id && track.has_cover));
+        assert_eq!(db.tracks().iter().filter(|track| track.has_cover).count(), with_cover_before + 1);
+
+        db.remove_cover(&[song.id]).unwrap();
+        db.save().unwrap();
+        drop(db);
+        let db = Database::open(path).expect("could not reopen the database");
+        assert!(db.cover(song.id, 40).is_none(), "the cover should be gone again");
+        assert_eq!(db.tracks().iter().filter(|track| track.has_cover).count(), with_cover_before);
+    }
+
+    // The same for the biggest album without a cover: all its songs at once.
+    // Run with OXIPOD_TEST_IPOD set. Writes to the iPod, but leaves it as it was.
+    #[test]
+    #[ignore = "writes to a mounted iPod"]
+    fn sets_and_removes_the_cover_of_a_whole_album() {
+        use gtk::gdk_pixbuf::Colorspace;
+
+        let mount = std::env::var("OXIPOD_TEST_IPOD").expect("OXIPOD_TEST_IPOD is not set");
+        let path = Path::new(&mount);
+        let mut db = Database::open(path).expect("could not open the database");
+        let tracks = db.tracks();
+        let with_cover_before = tracks.iter().filter(|track| track.has_cover).count();
+
+        let mut albums: std::collections::HashMap<&str, Vec<TrackId>> = std::collections::HashMap::new();
+        for track in tracks.iter().filter(|track| !track.has_cover) {
+            if let Some(album) = track.album.as_deref() {
+                albums.entry(album).or_default().push(track.id);
+            }
+        }
+        let (album, ids) = albums.into_iter().max_by_key(|(_, ids)| ids.len()).expect("an album without a cover");
+        assert!(ids.len() >= 3, "the biggest album without a cover has only {} songs", ids.len());
+        println!("giving “{album}” ({} songs) a cover", ids.len());
+
+        let picture = Pixbuf::new(Colorspace::Rgb, false, 8, 320, 320).unwrap();
+        picture.fill(0x4080c0ff);
+        let jpeg = picture.save_to_bufferv("jpeg", &[("quality", "90")]).unwrap();
+
+        assert_eq!(db.set_cover(&ids, &jpeg).unwrap(), ids.len());
+        db.save().unwrap();
+        drop(db);
+        let mut db = Database::open(path).expect("could not reopen the database");
+        for id in &ids {
+            assert!(db.cover(*id, 40).is_some(), "song {id} should have its cover after reopening");
+        }
+        assert_eq!(db.tracks().iter().filter(|track| track.has_cover).count(), with_cover_before + ids.len());
+
+        db.remove_cover(&ids).unwrap();
+        db.save().unwrap();
+        drop(db);
+        let db = Database::open(path).expect("could not reopen the database");
+        assert!(ids.iter().all(|id| db.cover(*id, 40).is_none()), "the covers should be gone again");
+        assert_eq!(db.tracks().iter().filter(|track| track.has_cover).count(), with_cover_before);
     }
 
     // Renames the iPod, checks the new name after reopening the database, and

@@ -1,4 +1,5 @@
 mod convert;
+mod covers;
 mod device;
 mod eject;
 mod export;

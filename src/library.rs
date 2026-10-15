@@ -12,11 +12,12 @@ use gtk::gdk_pixbuf::Pixbuf;
 use gtk::{gdk, gio, glib};
 
 use crate::convert;
+use crate::covers;
 use crate::eject;
 use crate::export::{self, Layout, Outcome};
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
 use crate::settings::Settings;
-use crate::songs::{SongList, SortMode, show_cover};
+use crate::songs::{SongFilter, SongList, SortMode, show_cover};
 
 /// Shown at this size in the song list.
 pub const COVER_SIZE: i32 = 40;
@@ -54,11 +55,14 @@ pub struct Library {
     search_button: gtk::ToggleButton,
     search_entry: gtk::SearchEntry,
     sort_button: gtk::MenuButton,
+    filter_button: gtk::MenuButton,
     selection_label: gtk::Label,
     select_all_button: gtk::Button,
     selection_add_button: gtk::MenuButton,
     selection_delete_button: gtk::Button,
     selection_copy_button: gtk::Button,
+    /// More things to do with the ticked songs (covers).
+    selection_more_button: gtk::MenuButton,
     /// Stops copying songs to the computer (only shown while that is going on).
     cancel_button: gtk::Button,
     /// Offers to delete files the database doesn't know about.
@@ -150,8 +154,17 @@ impl Library {
             .valign(gtk::Align::Center)
             .css_classes(["flat"])
             .build();
-        let heading = gtk::Box::builder().spacing(12).build();
+        let filter_button = gtk::MenuButton::builder()
+            .menu_model(&filter_menu())
+            .label(SongFilter::default().label())
+            .always_show_arrow(true)
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .tooltip_text("Show only some of the songs")
+            .build();
+        let heading = gtk::Box::builder().spacing(6).build();
         heading.append(&heading_text);
+        heading.append(&filter_button);
         heading.append(&sort_button);
 
         // The list itself is added to this stack once it exists (see below).
@@ -251,6 +264,14 @@ impl Library {
         let selection_label = gtk::Label::builder().ellipsize(gtk::pango::EllipsizeMode::End).build();
         let select_all_button = gtk::Button::with_label("Select All");
         let selection_copy_button = gtk::Button::with_label("Copy to Computer");
+        let selection_more_menu = gio::Menu::new();
+        selection_more_menu.append(Some("Choose Cover…"), Some("library.choose-cover-selected"));
+        selection_more_menu.append(Some("Remove Cover"), Some("library.remove-cover-selected"));
+        let selection_more_button = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .menu_model(&selection_more_menu)
+            .tooltip_text("Covers")
+            .build();
         let selection_add_button = gtk::MenuButton::builder().label("Add to Playlist").build();
         let selection_delete_button = gtk::Button::builder()
             .label("Delete")
@@ -262,6 +283,7 @@ impl Library {
         selection_bar.pack_end(&selection_delete_button);
         selection_bar.pack_end(&selection_add_button);
         selection_bar.pack_end(&selection_copy_button);
+        selection_bar.pack_end(&selection_more_button);
 
         let bottom_bar = gtk::Stack::new();
         bottom_bar.add_named(&progress_box, Some("progress"));
@@ -296,8 +318,8 @@ impl Library {
             };
             let song_menu = {
                 let this = this.clone();
-                move |id| match this.upgrade() {
-                    Some(library) => song_menu(id, &library.db.borrow().playlists(), None),
+                move |track: &Track, has_cover| match this.upgrade() {
+                    Some(library) => song_menu(track, has_cover, &library.db.borrow().playlists(), None),
                     None => gio::Menu::new(),
                 }
             };
@@ -321,11 +343,13 @@ impl Library {
                 search_button,
                 search_entry,
                 sort_button,
+                filter_button,
                 selection_label,
                 select_all_button,
                 selection_add_button,
                 selection_delete_button,
                 selection_copy_button,
+                selection_more_button,
                 cancel_button,
                 leftovers_banner,
                 songs_title,
@@ -540,6 +564,11 @@ impl Library {
     fn add_actions(self: &Rc<Self>) {
         self.add_action::<TrackId>("delete-song", |this, id| this.confirm_delete(vec![id]));
         self.add_action::<TrackId>("copy-song", |this, id| this.choose_export_folder(vec![id]));
+        self.add_action::<TrackId>("choose-cover", |this, id| this.choose_cover(vec![id]));
+        self.add_action::<TrackId>("choose-album-cover", |this, id| this.choose_album_cover(id));
+        self.add_action::<TrackId>("remove-cover", |this, id| this.remove_covers(vec![id]));
+        self.add_action::<()>("choose-cover-selected", |this, ()| this.choose_cover(this.selected_ids()));
+        self.add_action::<()>("remove-cover-selected", |this, ()| this.remove_covers(this.selected_ids()));
         self.add_action::<TrackId>("new-playlist-with-song", |this, id| {
             this.ask_playlist_name(vec![id]);
         });
@@ -563,6 +592,27 @@ impl Library {
         });
         self.add_action::<PlaylistId>("delete-playlist", |this, id| this.confirm_delete_playlist(id));
         self.add_sort_action();
+        self.add_filter_action();
+    }
+
+    /// The "Show" menu above the list, built like the "Sort by" menu.
+    fn add_filter_action(self: &Rc<Self>) {
+        let initial = SongFilter::default().id().to_variant();
+        let action = gio::SimpleAction::new_stateful("show", Some(glib::VariantTy::STRING), &initial);
+        let this = Rc::downgrade(self);
+        action.connect_change_state(move |action, state| {
+            let Some(state) = state else {
+                return;
+            };
+            let (Some(this), Some(filter)) = (this.upgrade(), state.str().and_then(SongFilter::from_id)) else {
+                return;
+            };
+            action.set_state(state);
+            this.songs.set_filter(filter);
+            this.filter_button.set_label(filter.label());
+            this.update_songs_view();
+        });
+        self.actions.add_action(&action);
     }
 
     /// The "Sort by" menu: an action that *remembers* which item is picked.
@@ -704,7 +754,7 @@ impl Library {
 
         let menu_button = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
-            .menu_model(&song_menu(track.id, playlists, in_playlist))
+            .menu_model(&song_menu(track, track.has_cover, playlists, in_playlist))
             .valign(gtk::Align::Center)
             .css_classes(["flat"])
             .tooltip_text("More")
@@ -743,11 +793,12 @@ impl Library {
         self.selection_label.set_text(&match (stats.selected, hidden) {
             (0, _) => "Select songs".to_string(),
             (count, 0) => format!("{} selected", songs_count(count)),
-            (count, hidden) => format!("{} selected, {hidden} hidden by the search", songs_count(count)),
+            (count, hidden) => format!("{} selected, {hidden} hidden by the search or filter", songs_count(count)),
         });
         self.selection_add_button.set_sensitive(stats.selected > 0);
         self.selection_delete_button.set_sensitive(stats.selected > 0);
         self.selection_copy_button.set_sensitive(stats.selected > 0);
+        self.selection_more_button.set_sensitive(stats.selected > 0);
         let all_ticked = stats.shown > 0 && stats.shown_selected == stats.shown;
         self.select_all_button.set_label(if all_ticked { "Select None" } else { "Select All" });
         self.select_all_button.set_sensitive(stats.shown > 0);
@@ -764,12 +815,13 @@ impl Library {
     /// of the "nothing here" pages is showing.
     fn update_songs_view(&self) {
         let stats = self.songs.stats();
+        let filter = self.songs.filter();
         let songs = |count: usize| if count == 1 { "1 Song".to_string() } else { format!("{count} Songs") };
         let length = format_duration(stats.shown_length);
-        self.songs_title.set_text(&if stats.shown == stats.total {
-            format!("{} · {length}", songs(stats.total))
-        } else {
-            format!("{} of {} · {length}", stats.shown, songs(stats.total))
+        self.songs_title.set_text(&match filter {
+            SongFilter::All if stats.shown == stats.total => format!("{} · {length}", songs(stats.total)),
+            SongFilter::All => format!("{} of {} · {length}", stats.shown, songs(stats.total)),
+            SongFilter::NoCover => format!("{} Without Cover Art · {length}", songs(stats.shown)),
         });
 
         let page = if stats.total == 0 {
@@ -780,9 +832,28 @@ impl Library {
             "list"
         };
         if page == "no-results" {
+            // The page says why nothing is shown: the search, or the filter.
             // The description of a status page is markup, so escape the text.
-            let query = glib::markup_escape_text(self.search_entry.text().trim());
-            self.no_results.set_description(Some(&format!("No songs match “{query}”")));
+            let query = self.search_entry.text();
+            let query = query.trim();
+            if !query.is_empty() {
+                self.no_results.set_icon_name(Some("edit-find-symbolic"));
+                self.no_results.set_title("No Results");
+                let text = match filter {
+                    SongFilter::All => format!("No songs match “{}”", glib::markup_escape_text(query)),
+                    SongFilter::NoCover => format!("No song without cover art matches “{}”", glib::markup_escape_text(query)),
+                };
+                self.no_results.set_description(Some(&text));
+            } else {
+                match filter {
+                    SongFilter::NoCover => {
+                        self.no_results.set_icon_name(Some("emblem-ok-symbolic"));
+                        self.no_results.set_title("Every Song Has a Cover");
+                        self.no_results.set_description(Some("There are no songs without cover art."));
+                    }
+                    SongFilter::All => {}
+                }
+            }
         }
         self.songs_stack.set_visible_child_name(page);
     }
@@ -1105,6 +1176,118 @@ impl Library {
             };
             this.export(ids, path, layout).await;
         });
+    }
+
+    /// The songs on the same album as `id` (the song itself included), and
+    /// the album's name. `None` if the song isn't on an album.
+    fn album_of(&self, id: TrackId) -> Option<(String, Vec<TrackId>)> {
+        album_of(&self.db.borrow().tracks(), id)
+    }
+
+    /// Asks for a picture and makes it the cover of these songs.
+    fn choose_cover(self: &Rc<Self>, ids: Vec<TrackId>) {
+        let what = match ids.as_slice() {
+            [] => return,
+            [id] => {
+                let title = self.db.borrow().tracks().into_iter().find(|track| track.id == *id).and_then(|track| track.title);
+                format!("“{}”", title.unwrap_or_else(|| "This Song".into()))
+            }
+            _ => songs_count(ids.len()),
+        };
+        self.pick_cover(ids, what);
+    }
+
+    /// The same for every song on the album of `id`.
+    fn choose_album_cover(self: &Rc<Self>, id: TrackId) {
+        match self.album_of(id) {
+            Some((album, ids)) => {
+                let what = format!("the album “{album}” ({})", songs_count(ids.len()));
+                self.pick_cover(ids, what);
+            }
+            None => self.toast("This song isn't on an album"),
+        }
+    }
+
+    /// The file chooser for a cover, and what happens with the picture.
+    fn pick_cover(self: &Rc<Self>, ids: Vec<TrackId>, what: String) {
+        if self.busy.get() {
+            self.toast("Wait until the current job is done");
+            return;
+        }
+        // Only show files that are pictures the app can read.
+        let pictures = gtk::FileFilter::new();
+        pictures.set_name(Some("Pictures"));
+        pictures.add_pixbuf_formats();
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&pictures);
+        let dialog = gtk::FileDialog::builder()
+            .title(format!("Choose a Cover for {what}"))
+            .accept_label("Use as Cover")
+            .filters(&filters)
+            .build();
+        if let Some(folder) = glib::user_special_dir(glib::UserDirectory::Pictures) {
+            dialog.set_initial_folder(Some(&gio::File::for_path(folder)));
+        }
+
+        let window = self.page.root().and_downcast::<gtk::Window>();
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            // An error here usually means the dialog was cancelled.
+            let Ok(file) = dialog.open_future(window.as_ref()).await else {
+                return;
+            };
+            let Some(path) = file.path() else {
+                this.toast("That file can't be used");
+                return;
+            };
+            // Reading and shrinking a big picture takes a moment, so it
+            // happens on a background thread.
+            match gio::spawn_blocking(move || covers::jpeg_from_file(&path)).await {
+                Ok(Ok(jpeg)) => this.set_covers(ids, jpeg),
+                Ok(Err(error)) => this.toast(&format!("Couldn't use that picture: {}", error.message())),
+                Err(_) => this.toast("Couldn't use that picture"),
+            }
+        });
+    }
+
+    /// Makes `jpeg` the cover of the songs and saves it to the iPod.
+    fn set_covers(self: &Rc<Self>, ids: Vec<TrackId>, jpeg: Vec<u8>) {
+        // The pictures loaded for these songs are out of date from now on.
+        self.forget_covers(&ids);
+        let mut done = 0;
+        let saved = self.change(|db| {
+            done = db.set_cover(&ids, &jpeg)?;
+            Ok(())
+        });
+        self.songs.reset_covers(&ids);
+        if saved {
+            if done == ids.len() {
+                self.toast(&format!("Cover set for {}", songs_count(done)));
+            } else {
+                self.toast(&format!("Cover set for {done} of {}", songs_count(ids.len())));
+            }
+        }
+    }
+
+    /// Takes the cover away from these songs.
+    fn remove_covers(self: &Rc<Self>, ids: Vec<TrackId>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.forget_covers(&ids);
+        let saved = self.change(|db| db.remove_cover(&ids));
+        self.songs.reset_covers(&ids);
+        if saved {
+            self.toast(&format!("Removed the cover from {}", songs_count(ids.len())));
+        }
+    }
+
+    /// Throws away the covers loaded for these songs, so they're read again.
+    fn forget_covers(&self, ids: &[TrackId]) {
+        let mut covers = self.covers.borrow_mut();
+        for id in ids {
+            covers.remove(id);
+        }
     }
 
     /// Works out where each song's file is and what to call it. This happens
@@ -1466,7 +1649,12 @@ impl Library {
 }
 
 /// The ⋮ menu of a song.
-fn song_menu(id: TrackId, playlists: &[gpod::Playlist], in_playlist: Option<PlaylistId>) -> gio::Menu {
+///
+/// `has_cover` is whether the song has a cover right now; the menu offers to
+/// remove one only then, and to choose one for the album only if the song is
+/// on an album.
+fn song_menu(track: &Track, has_cover: bool, playlists: &[gpod::Playlist], in_playlist: Option<PlaylistId>) -> gio::Menu {
+    let id = track.id;
     let add_to = gio::Menu::new();
     for playlist in playlists.iter().filter(|playlist| Some(playlist.id) != in_playlist) {
         let item = gio::MenuItem::new(Some(&playlist.name), None);
@@ -1487,6 +1675,23 @@ fn song_menu(id: TrackId, playlists: &[gpod::Playlist], in_playlist: Option<Play
     let copy = gio::MenuItem::new(Some("Copy to Computer…"), None);
     copy.set_action_and_target_value(Some("library.copy-song"), Some(&id.to_variant()));
     menu.append_item(&copy);
+
+    // Everything about the song's cover, in a section of its own.
+    let covers = gio::Menu::new();
+    let choose = gio::MenuItem::new(Some("Choose Cover…"), None);
+    choose.set_action_and_target_value(Some("library.choose-cover"), Some(&id.to_variant()));
+    covers.append_item(&choose);
+    if track.album.as_deref().is_some_and(|album| !album.trim().is_empty()) {
+        let album = gio::MenuItem::new(Some("Choose Cover for Album…"), None);
+        album.set_action_and_target_value(Some("library.choose-album-cover"), Some(&id.to_variant()));
+        covers.append_item(&album);
+    }
+    if has_cover {
+        let remove = gio::MenuItem::new(Some("Remove Cover"), None);
+        remove.set_action_and_target_value(Some("library.remove-cover"), Some(&id.to_variant()));
+        covers.append_item(&remove);
+    }
+    menu.append_section(None, &covers);
 
     let delete = gio::Menu::new();
     let item = gio::MenuItem::new(Some("Delete from iPod…"), None);
@@ -1546,6 +1751,17 @@ fn sort_menu() -> gio::Menu {
     menu
 }
 
+/// The "Show" menu above the list: one radio item per filter, all for the `library.show` action.
+fn filter_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    for filter in SongFilter::ALL {
+        let item = gio::MenuItem::new(Some(filter.label()), None);
+        item.set_action_and_target_value(Some("library.show"), Some(&filter.id().to_variant()));
+        menu.append_item(&item);
+    }
+    menu
+}
+
 fn sort_label(mode: SortMode) -> String {
     format!("Sort by {}", mode.label())
 }
@@ -1589,6 +1805,20 @@ fn songs_count(count: usize) -> String {
     if count == 1 { "1 song".into() } else { format!("{count} songs") }
 }
 
+/// The album of the song `id` and all the songs on it (that song included).
+/// `None` if the song isn't on an album. Albums are compared without caring
+/// about capitals or spaces around the name.
+fn album_of(tracks: &[Track], id: TrackId) -> Option<(String, Vec<TrackId>)> {
+    let album = tracks.iter().find(|track| track.id == id)?.album.clone()?;
+    let key = album.trim().to_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    let same_album = |track: &&Track| track.album.as_deref().is_some_and(|other| other.trim().to_lowercase() == key);
+    let ids = tracks.iter().filter(same_album).map(|track| track.id).collect();
+    Some((album, ids))
+}
+
 fn texture_from_pixbuf(pixbuf: &Pixbuf) -> gdk::Texture {
     let format = if pixbuf.has_alpha() { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
     gdk::MemoryTexture::new(
@@ -1609,5 +1839,35 @@ pub fn format_duration(length: Duration) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn song(id: TrackId, album: Option<&str>) -> Track {
+        Track { id, album: album.map(str::to_string), ..Default::default() }
+    }
+
+    #[test]
+    fn finds_the_songs_of_an_album_ignoring_capitals_and_spaces() {
+        let tracks = [
+            song(1, Some("Voluntary Grief")),
+            song(2, Some(" voluntary grief ")),
+            song(3, Some("Scarred Summer")),
+            song(4, None),
+        ];
+        assert_eq!(album_of(&tracks, 2), Some((" voluntary grief ".to_string(), vec![1, 2])));
+        assert_eq!(album_of(&tracks, 3), Some(("Scarred Summer".to_string(), vec![3])));
+    }
+
+    #[test]
+    fn a_song_without_an_album_has_no_album_mates() {
+        let tracks = [song(1, None), song(2, Some("")), song(3, Some("  ")), song(4, None)];
+        for id in 1..=4 {
+            assert_eq!(album_of(&tracks, id), None);
+        }
+        assert_eq!(album_of(&tracks, 99), None);
     }
 }
