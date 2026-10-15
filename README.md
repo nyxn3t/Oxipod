@@ -14,6 +14,8 @@ music on the window, and that's it.
   on the fly. MP3 and AAC/ALAC files are copied as they are
 - Copies cover art, either from the file or from a `cover.jpg` in the album
   folder
+- Search the songs on the iPod (Ctrl+F) and sort them by title, artist, album
+  or when you added them. The list stays quick even with thousands of songs
 - Playlists: create them, add songs, remove songs
 - Delete songs from the iPod, or select a bunch and delete them or add them
   to a playlist in one go

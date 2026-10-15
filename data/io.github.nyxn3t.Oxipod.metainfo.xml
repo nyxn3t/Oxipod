@@ -21,6 +21,7 @@
       <li>Add songs and whole folders by dragging them onto the window</li>
       <li>Converts FLAC, Opus, Ogg, WAV and other formats to MP3 automatically</li>
       <li>Copies cover art from the file or from a cover image in the album folder</li>
+      <li>Search the songs and sort them by title, artist, album or date added</li>
       <li>Create playlists and add or remove songs</li>
       <li>Delete songs from the iPod, one at a time or several at once</li>
       <li>Finds and cleans up leftover files from interrupted syncs</li>
@@ -36,7 +37,7 @@
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.2.0/data/screenshots/songs.png</image>
+      <image>https://raw.githubusercontent.com/nyxn3t/Oxipod/v0.3.0/data/screenshots/songs.png</image>
       <caption>The songs on an iPod nano</caption>
     </screenshot>
   </screenshots>
@@ -66,6 +67,17 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.0" date="2026-10-15">
+      <description>
+        <p>The song list is a lot faster with big libraries, and you can now search and sort it.</p>
+        <ul>
+          <li>Search your songs (Ctrl+F)</li>
+          <li>Sort by title, artist, album or when you added them</li>
+          <li>Select All only ticks the songs the search shows</li>
+          <li>No more GLib warnings when ejecting</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-14">
       <description>
         <p>Select several songs at once to delete them or add them to a playlist.</p>
