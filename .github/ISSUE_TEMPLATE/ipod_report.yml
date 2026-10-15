@@ -1,0 +1,62 @@
+name: I tried it with my iPod
+description: Tell me which iPod you used and how it went, whether it worked or not
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        So far Oxipod has only been tried with an iPod nano 3rd gen, so every report about another iPod helps, good news or bad.
+
+        Oxipod writes to your iPod's music database. It offers a backup when you open an iPod, and it's a good idea to say yes.
+
+  - type: input
+    id: ipod
+    attributes:
+      label: Which iPod is it?
+      description: The kind and size, as far as you know.
+      placeholder: iPod classic 120 GB, nano 4th gen 8 GB, mini, ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: How did it go?
+      options:
+        - Everything I tried worked
+        - Some things worked, some didn't (details below)
+        - It didn't work
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: worked
+    attributes:
+      label: What worked?
+      description: Tick what you tried and what worked.
+      options:
+        - label: The iPod showed up and opened
+        - label: Adding songs, and they play on the iPod
+        - label: Cover art shows on the iPod
+        - label: Playlists
+        - label: Deleting songs
+        - label: Copying songs back to the computer
+        - label: Ejecting from Oxipod
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+      description: What went wrong, what looked odd, what you'd like to see.
+    validations:
+      required: false
+
+  - type: textarea
+    id: troubleshooting
+    attributes:
+      label: Troubleshooting info
+      description: |
+        On the list of iPods, open the main menu (the three lines at the top right), choose About Oxipod, then Troubleshooting, and copy the text, with the iPod plugged in. It has the model, the file system and your Oxipod version. It leaves out names and paths.
+      render: text
+    validations:
+      required: true
