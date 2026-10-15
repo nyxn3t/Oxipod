@@ -1,6 +1,7 @@
 mod convert;
 mod device;
 mod eject;
+mod export;
 mod gpod;
 mod library;
 mod songs;

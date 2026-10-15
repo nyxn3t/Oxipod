@@ -1,5 +1,5 @@
 //! The page for one iPod: its songs and playlists, adding and deleting songs,
-//! editing playlists, and ejecting.
+//! editing playlists, copying songs back to the computer, and ejecting.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -13,6 +13,7 @@ use gtk::{gdk, gio, glib};
 
 use crate::convert;
 use crate::eject;
+use crate::export::{self, Outcome};
 use crate::gpod::{self, Database, PlaylistId, Track, TrackId};
 use crate::songs::{SongList, SortMode, show_cover};
 
@@ -56,6 +57,9 @@ pub struct Library {
     select_all_button: gtk::Button,
     selection_add_button: gtk::MenuButton,
     selection_delete_button: gtk::Button,
+    selection_copy_button: gtk::Button,
+    /// Stops copying songs to the computer (only shown while that is going on).
+    cancel_button: gtk::Button,
     /// Offers to delete files the database doesn't know about.
     leftovers_banner: adw::Banner,
     /// "35 Songs · 2h 5m" and the iPod's details, above the song list.
@@ -72,6 +76,8 @@ pub struct Library {
     covers: RefCell<HashMap<TrackId, Option<gdk::Texture>>>,
     /// True while songs are being added; other changes wait until it's done.
     busy: Cell<bool>,
+    /// Set by the Cancel button; the copy job looks at it after every song.
+    cancel: Cell<bool>,
 }
 
 /// Why adding a song didn't work.
@@ -80,6 +86,13 @@ enum ImportError {
     Song(String),
     /// Adding more songs is pointless (the iPod is full or gone).
     Stop(String),
+}
+
+/// One song to copy to the computer: where its file is on the iPod, and what
+/// to call it there.
+struct ExportJob {
+    source: PathBuf,
+    name: String,
 }
 
 struct OpenPlaylist {
@@ -208,11 +221,17 @@ impl Library {
         header.pack_end(&select_button);
         header.pack_end(&search_button);
 
-        // Shown at the bottom while songs are being added.
+        // Shown at the bottom while songs are being added or copied.
         let progress_label = gtk::Label::builder()
             .xalign(0.0)
+            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .build();
+        // Only copying can be cancelled, so the button starts out hidden.
+        let cancel_button = gtk::Button::builder().label("Cancel").visible(false).build();
+        let progress_top = gtk::Box::builder().spacing(12).build();
+        progress_top.append(&progress_label);
+        progress_top.append(&cancel_button);
         let progress = gtk::ProgressBar::new();
         let progress_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -222,12 +241,13 @@ impl Library {
             .margin_start(12)
             .margin_end(12)
             .build();
-        progress_box.append(&progress_label);
+        progress_box.append(&progress_top);
         progress_box.append(&progress);
 
         // Shown in selection mode.
-        let selection_label = gtk::Label::new(None);
+        let selection_label = gtk::Label::builder().ellipsize(gtk::pango::EllipsizeMode::End).build();
         let select_all_button = gtk::Button::with_label("Select All");
+        let selection_copy_button = gtk::Button::with_label("Copy to Computer");
         let selection_add_button = gtk::MenuButton::builder().label("Add to Playlist").build();
         let selection_delete_button = gtk::Button::builder()
             .label("Delete")
@@ -238,6 +258,7 @@ impl Library {
         selection_bar.set_center_widget(Some(&selection_label));
         selection_bar.pack_end(&selection_delete_button);
         selection_bar.pack_end(&selection_add_button);
+        selection_bar.pack_end(&selection_copy_button);
 
         let bottom_bar = gtk::Stack::new();
         bottom_bar.add_named(&progress_box, Some("progress"));
@@ -301,6 +322,8 @@ impl Library {
                 select_all_button,
                 selection_add_button,
                 selection_delete_button,
+                selection_copy_button,
+                cancel_button,
                 leftovers_banner,
                 songs_title,
                 songs_details,
@@ -311,6 +334,7 @@ impl Library {
                 open_playlist: RefCell::new(None),
                 covers: RefCell::new(HashMap::new()),
                 busy: Cell::new(false),
+                cancel: Cell::new(false),
             }
         });
 
@@ -380,6 +404,23 @@ impl Library {
         self.selection_delete_button.connect_clicked(move |_| {
             if let Some(this) = this.upgrade() {
                 this.confirm_delete(this.selected_ids());
+            }
+        });
+
+        let this = Rc::downgrade(self);
+        self.selection_copy_button.connect_clicked(move |_| {
+            if let Some(this) = this.upgrade() {
+                this.choose_export_folder(this.selected_ids());
+            }
+        });
+
+        // Cancel only sets a flag: the copy job checks it after every song and
+        // stops by itself.
+        let this = Rc::downgrade(self);
+        self.cancel_button.connect_clicked(move |button| {
+            if let Some(this) = this.upgrade() {
+                this.cancel.set(true);
+                button.set_sensitive(false);
             }
         });
 
@@ -494,6 +535,7 @@ impl Library {
     /// action ("library.delete-song") and a target value (the song's id).
     fn add_actions(self: &Rc<Self>) {
         self.add_action::<TrackId>("delete-song", |this, id| this.confirm_delete(vec![id]));
+        self.add_action::<TrackId>("copy-song", |this, id| this.choose_export_folder(vec![id]));
         self.add_action::<TrackId>("new-playlist-with-song", |this, id| {
             this.ask_playlist_name(vec![id]);
         });
@@ -701,6 +743,7 @@ impl Library {
         });
         self.selection_add_button.set_sensitive(stats.selected > 0);
         self.selection_delete_button.set_sensitive(stats.selected > 0);
+        self.selection_copy_button.set_sensitive(stats.selected > 0);
         let all_ticked = stats.shown > 0 && stats.shown_selected == stats.shown;
         self.select_all_button.set_label(if all_ticked { "Select None" } else { "Select All" });
         self.select_all_button.set_sensitive(stats.shown > 0);
@@ -774,7 +817,7 @@ impl Library {
     /// page. Errors are shown as a toast. Returns whether it worked.
     fn change(&self, edit: impl FnOnce(&mut Database) -> Result<(), gpod::Error>) -> bool {
         if self.busy.get() {
-            self.toast("Wait until the songs are added");
+            self.toast("Wait until the current job is done");
             return false;
         }
         // The block limits how long the database is borrowed: refresh below
@@ -836,17 +879,11 @@ impl Library {
             return;
         }
         if self.busy.replace(true) {
-            self.toast("Already adding songs");
+            self.toast("Wait until the current job is done");
             return;
         }
-        self.select_button.set_active(false);
-        self.select_button.set_sensitive(false);
-        self.add_button.set_sensitive(false);
-        self.eject_button.set_sensitive(false);
+        self.begin_job(false);
         self.leftovers_banner.set_revealed(false);
-        self.progress.set_fraction(0.0);
-        self.bottom_bar.set_visible_child_name("progress");
-        self.toolbar.set_reveal_bottom_bars(true);
 
         let mut added = 0;
         let mut failed = Vec::new();
@@ -883,11 +920,7 @@ impl Library {
             save_error = self.db.borrow_mut().save().err();
         }
 
-        self.busy.set(false);
-        self.select_button.set_sensitive(true);
-        self.add_button.set_sensitive(true);
-        self.eject_button.set_sensitive(true);
-        self.toolbar.set_reveal_bottom_bars(false);
+        self.end_job();
         self.refresh();
         self.check_leftovers();
 
@@ -953,6 +986,179 @@ impl Library {
         // `prepared` is dropped here, which deletes the converted temp file.
     }
 
+    /// Gets the window ready for a long job (adding or copying songs): whatever
+    /// could get in its way is switched off, and the progress bar shows up.
+    /// Only a job that can be cancelled shows the Cancel button.
+    fn begin_job(&self, cancellable: bool) {
+        self.select_button.set_active(false);
+        self.select_button.set_sensitive(false);
+        self.add_button.set_sensitive(false);
+        self.eject_button.set_sensitive(false);
+        self.cancel.set(false);
+        self.cancel_button.set_visible(cancellable);
+        self.cancel_button.set_sensitive(true);
+        self.progress.set_fraction(0.0);
+        self.bottom_bar.set_visible_child_name("progress");
+        self.toolbar.set_reveal_bottom_bars(true);
+    }
+
+    /// Undoes `begin_job`.
+    fn end_job(&self) {
+        self.busy.set(false);
+        self.select_button.set_sensitive(true);
+        self.add_button.set_sensitive(true);
+        self.eject_button.set_sensitive(true);
+        self.toolbar.set_reveal_bottom_bars(false);
+    }
+
+    /// Asks where to put the songs, then copies them there.
+    fn choose_export_folder(self: &Rc<Self>, ids: Vec<TrackId>) {
+        if ids.is_empty() {
+            return;
+        }
+        if self.busy.get() {
+            self.toast("Wait until the current job is done");
+            return;
+        }
+        let dialog = gtk::FileDialog::builder().title("Copy to Computer").accept_label("Copy").build();
+        // Start in the Music folder, if there is one.
+        if let Some(music) = glib::user_special_dir(glib::UserDirectory::Music) {
+            dialog.set_initial_folder(Some(&gio::File::for_path(music)));
+        }
+
+        let window = self.page.root().and_downcast::<gtk::Window>();
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            // An error here usually means the dialog was cancelled.
+            let Ok(folder) = dialog.select_folder_future(window.as_ref()).await else {
+                return;
+            };
+            let Some(path) = folder.path() else {
+                this.toast("That folder can't be used");
+                return;
+            };
+            this.export(ids, path).await;
+        });
+    }
+
+    /// Works out where each song's file is and what to call it. This happens
+    /// up front, on the main thread where the database is, so the copying
+    /// thread only needs plain paths. Songs the database doesn't have a file
+    /// for are left out.
+    fn export_jobs(&self, ids: &[TrackId]) -> Vec<ExportJob> {
+        let db = self.db.borrow();
+        let tracks: HashMap<TrackId, Track> = db.tracks().into_iter().map(|track| (track.id, track)).collect();
+        ids.iter()
+            .filter_map(|id| {
+                // `?` in a closure that returns an Option: no track, no job.
+                let track = tracks.get(id)?;
+                let source = db.track_file(*id)?;
+                let extension = source.extension().and_then(|e| e.to_str()).unwrap_or("mp3").to_lowercase();
+                let name = export::file_name(track.artist.as_deref(), track.title.as_deref(), &extension);
+                Some(ExportJob { source, name })
+            })
+            .collect()
+    }
+
+    /// Copies songs from the iPod into `folder`, one at a time, under
+    /// readable names. Like `import`, this is an `async fn`: every `.await`
+    /// lets GTK redraw and handle clicks (the Cancel button, say) while a file
+    /// is copied on a background thread.
+    async fn export(self: Rc<Self>, ids: Vec<TrackId>, folder: PathBuf) {
+        let jobs = self.export_jobs(&ids);
+        if jobs.is_empty() {
+            self.toast("Nothing to copy");
+            return;
+        }
+
+        // Check the room before starting: the folder may be on a small drive.
+        let needed: u64 = jobs.iter().filter_map(|job| std::fs::metadata(&job.source).ok()).map(|file| file.len()).sum();
+        if let Some(free) = free_space_at(&folder)
+            && free < needed
+        {
+            self.toast(&format!(
+                "Not enough room there: the songs need {}, the folder has {} free",
+                glib::format_size(needed),
+                glib::format_size(free)
+            ));
+            return;
+        }
+
+        if self.busy.replace(true) {
+            self.toast("Wait until the current job is done");
+            return;
+        }
+        self.begin_job(true);
+
+        let mut report = export::Report::default();
+        // One of the copied files, so "Show Files" has something to point at.
+        let mut a_file = None;
+        for (i, job) in jobs.iter().enumerate() {
+            if self.cancel.get() {
+                report.stopped = Some("Cancelled.".into());
+                break;
+            }
+            if !self.is_connected() {
+                report.stopped = Some("The iPod was disconnected.".into());
+                break;
+            }
+            self.progress_label.set_text(&format!("Copying {} of {}: {}", i + 1, jobs.len(), job.name));
+
+            // Everything the thread uses is moved into it, like in import_file.
+            let (source, target_folder, name) = (job.source.clone(), folder.clone(), job.name.clone());
+            match gio::spawn_blocking(move || export::copy_song(&source, &target_folder, &name)).await {
+                Ok(Ok(Outcome::Copied(path))) => {
+                    report.copied += 1;
+                    a_file.get_or_insert(path);
+                }
+                Ok(Ok(Outcome::AlreadyThere(path))) => {
+                    report.already_there += 1;
+                    a_file.get_or_insert(path);
+                }
+                // A full disk won't get better with the next song.
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::StorageFull => {
+                    report.stopped = Some("The disk is full.".into());
+                    break;
+                }
+                Ok(Err(error)) => report.failed.push(format!("{}: {error}", job.name)),
+                Err(_) => report.failed.push(format!("{}: the copy crashed", job.name)),
+            }
+            self.progress.set_fraction((i + 1) as f64 / jobs.len() as f64);
+        }
+
+        self.end_job();
+        for failure in &report.failed {
+            eprintln!("Couldn't copy {failure}");
+        }
+        let folder_name = match folder.file_name() {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => folder.display().to_string(),
+        };
+        self.show_export_result(&report.message(&folder_name), a_file);
+    }
+
+    /// A message about how the copying went, with a "Show Files" button that
+    /// opens the folder in the file manager.
+    fn show_export_result(&self, message: &str, a_file: Option<PathBuf>) {
+        let toast = adw::Toast::builder().title(glib::markup_escape_text(message)).timeout(10).build();
+        if let Some(file) = a_file {
+            toast.set_button_label(Some("Show Files"));
+            // A weak reference: the toast (and so this closure) lives in the
+            // window, and a strong one would make a loop.
+            let window = self.page.root().and_downcast::<gtk::Window>().map(|window| window.downgrade());
+            toast.connect_button_clicked(move |_| {
+                let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&file)));
+                let window = window.as_ref().and_then(|window| window.upgrade());
+                glib::spawn_future_local(async move {
+                    if let Err(error) = launcher.open_containing_folder_future(window.as_ref()).await {
+                        eprintln!("Couldn't show the folder: {error}");
+                    }
+                });
+            });
+        }
+        self.toasts.add_toast(toast);
+    }
+
     /// Whether the iPod is still there. When it's unplugged, the mount
     /// point disappears or becomes an empty folder.
     fn is_connected(&self) -> bool {
@@ -961,10 +1167,7 @@ impl Library {
 
     /// Free space on the iPod in bytes, if it can be read.
     fn free_space(&self) -> Option<u64> {
-        let info = gio::File::for_path(&self.mount_path)
-            .query_filesystem_info(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE, gio::Cancellable::NONE)
-            .ok()?;
-        Some(info.attribute_uint64(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE))
+        free_space_at(&self.mount_path)
     }
 
     /// Shows the banner if the iPod has song files the database doesn't know.
@@ -1210,6 +1413,9 @@ fn song_menu(id: TrackId, playlists: &[gpod::Playlist], in_playlist: Option<Play
         item.set_action_and_target_value(Some("library.remove-from-playlist"), Some(&(playlist, id).to_variant()));
         menu.append_item(&item);
     }
+    let copy = gio::MenuItem::new(Some("Copy to Computer…"), None);
+    copy.set_action_and_target_value(Some("library.copy-song"), Some(&id.to_variant()));
+    menu.append_item(&copy);
 
     let delete = gio::Menu::new();
     let item = gio::MenuItem::new(Some("Delete from iPod…"), None);
@@ -1293,6 +1499,14 @@ fn with_test_songs(mut tracks: Vec<Track>) -> Vec<Track> {
         added: 1_700_000_000 + n * 60,
     }));
     tracks
+}
+
+/// Free space on the drive that `path` is on, in bytes, if it can be read.
+fn free_space_at(path: &Path) -> Option<u64> {
+    let info = gio::File::for_path(path)
+        .query_filesystem_info(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE, gio::Cancellable::NONE)
+        .ok()?;
+    Some(info.attribute_uint64(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE))
 }
 
 fn files_count(count: usize) -> String {

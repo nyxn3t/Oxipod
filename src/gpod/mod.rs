@@ -415,6 +415,15 @@ impl Database {
         Ok(())
     }
 
+    /// Where a song's file is on the iPod, or None if the database has no such
+    /// song. The file's name there is made up by libgpod (like
+    /// `F04/libgpod313602.mp3`) and says nothing about the song.
+    pub fn track_file(&self, id: TrackId) -> Option<PathBuf> {
+        let track = self.find_track(id).ok()?;
+        // SAFETY: `track` belongs to the database.
+        unsafe { filename_on_ipod(track) }
+    }
+
     /// Song files in the iPod's music folders that no song in the database
     /// points to, with their sizes. They take up space but the iPod can't play
     /// them; they're usually left over from an interrupted sync.
@@ -426,17 +435,8 @@ impl Database {
         let used: std::collections::HashSet<PathBuf> = self
             .track_ptrs()
             .into_iter()
-            // SAFETY: the tracks belong to the database. itdb_filename_on_ipod
-            // returns a new string (or NULL) that we free with g_free.
-            .filter_map(|track| unsafe {
-                let file = ffi::itdb_filename_on_ipod(track);
-                if file.is_null() {
-                    return None;
-                }
-                let path = path_from_c(file);
-                ffi::g_free(file.cast());
-                Some(path)
-            })
+            // SAFETY: the tracks belong to the database.
+            .filter_map(|track| unsafe { filename_on_ipod(track) })
             .collect();
 
         // The music is spread over folders F00, F01, …; anything else in the
@@ -579,6 +579,25 @@ unsafe fn track_from_raw(track: &ffi::Itdb_Track) -> Track {
             disc_number: track.cd_nr,
             added: track.time_added.max(0) as u64,
         }
+    }
+}
+
+/// Where libgpod says a song's file is on the iPod.
+///
+/// # Safety
+/// `track` must be a valid track of an open database.
+unsafe fn filename_on_ipod(track: *mut ffi::Itdb_Track) -> Option<PathBuf> {
+    // SAFETY: guaranteed by the caller. itdb_filename_on_ipod returns a new
+    // string (or NULL), which is freed with g_free once it's been copied into
+    // a PathBuf.
+    unsafe {
+        let file = ffi::itdb_filename_on_ipod(track);
+        if file.is_null() {
+            return None;
+        }
+        let path = path_from_c(file);
+        ffi::g_free(file.cast());
+        Some(path)
     }
 }
 
